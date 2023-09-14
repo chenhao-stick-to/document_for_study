@@ -1,4 +1,4 @@
-# 1.Liunx创建新用户
+# 1.Liunx简单命令
 
 ## 切换到root权限，
 
@@ -33,3 +33,7 @@ uname
 设置代理 git config --global https.proxy http://127.0.0.1:1080
 
 git config --global user.name "chenhao-stick-to"
+
+# 命令行的快速操作
+使用 ctrl +A可以实现快速的将光标切换到命令行首字符。
+使用ctrl + <- 或者 -> 实现光标快速切换到左右的整个单词
