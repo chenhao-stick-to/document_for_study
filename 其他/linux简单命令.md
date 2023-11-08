@@ -8,7 +8,7 @@
 
 su命令切换用户
 
-mkdir创建目录。rmkdir删除文件。
+mkdir创建目录。rmkdir删除文件。/mkdir -p 创建多级目录
 
 pwd 获取当前目录绝对路径
 
@@ -23,6 +23,9 @@ ldd查看可执行文件依赖库文件
 df -a
 
 uname
+file foobar.o 可以查看文件的格式
+![image-20231007103010273](linux简单命令.assets/image-20231007103010273.png)
+touch 创建文件
 
 **解决git clone时的 fatal: unable to access 'https://github.com/apache/tvm.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.问题：**
 
