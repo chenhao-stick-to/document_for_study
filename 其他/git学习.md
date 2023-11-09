@@ -6,6 +6,16 @@
 ![image-20230914094602791](git学习.assets/image-20230914094602791.png)
 其他：ssh -T github.com 查看是否能连接上
 
+**解决git clone时的 fatal: unable to access 'https://github.com/apache/tvm.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.问题：**
+
+ **git config --global https.postBuffer 1048576000**
+
+**git config --global http.sslVerify或者https.sslVerify false  此行命令跳过ssl验证**
+
+设置代理 git config --global https.proxy http://127.0.0.1:1080
+
+git config --global user.name "chenhao-stick-to"
+
 ## 杂乱的学习
 ### 开始创建git目录时:
 git init -->git add . -->git commit -m "first commit" --> git branch -M main -->git remote add origin git@github.com:chenhao-stick-to/document_for_study.git -->git push -u origin main

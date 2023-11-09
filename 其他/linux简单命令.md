@@ -3,8 +3,9 @@
 ## 切换到root权限，
 
 使用sudo useradd -m +用户名创建新用户，会在/home下生产对应用户文件，这样可以进行远程登录。区别与创建的普通用户。
-
-使用sudo passwd+用户名 设置密码
+使用sudo passwd+用户名 **设置密码**
+sudo chsh -s /bin/bash 用户名  //可设置用户的默认终端为bash
+sudo visudo  //修改sudoer文件，添加用户权限为ALL=(ALL:ALL) ALL
 
 su命令切换用户
 
@@ -27,15 +28,6 @@ file foobar.o 可以查看文件的格式
 ![image-20231007103010273](linux简单命令.assets/image-20231007103010273.png)
 touch 创建文件
 
-**解决git clone时的 fatal: unable to access 'https://github.com/apache/tvm.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.问题：**
-
- **git config --global https.postBuffer 1048576000**
-
-**git config --global http.sslVerify或者https.sslVerify false  此行命令跳过ssl验证**
-
-设置代理 git config --global https.proxy http://127.0.0.1:1080
-
-git config --global user.name "chenhao-stick-to"
 
 # 命令行的快速操作
 使用 ctrl +A可以实现快速的将光标切换到命令行首字符。
