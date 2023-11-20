@@ -28,6 +28,7 @@ git rebase则是直接从目标分支上进行提交，而不是两者的合并�
 git checkout <目标分支>
 git rebase <源分支>
 这会将源分支的部分提交到目标分支上。
+git clone --branch v2.6.39 --depth=1 git@github.com:torvalds/linux.git clone指定tag的库到本地
 git commit --amend  y应用于本地分支，将多次commmit的提交合并到一次commit上，需不需要跟 -m "一样的tag"？
 git ls-remote git@github.com:chenhao-stick-to/document_for_study.git 测试远端能否直接连接。
 git log 查看commit的历史
