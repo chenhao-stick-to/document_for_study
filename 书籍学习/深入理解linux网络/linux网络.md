@@ -894,4 +894,118 @@ tcpdump工作在ip_rcv处理函数之前，在设备层，netfilter工作在ip�
 有什么办法能绕过内核协议栈，直接从网卡接收数据?
 这样繁杂的内核协议栈处理，内核态到用户态内存的拷贝开销，唤醒用户进程的开销都可以省掉了。==DPDK技术==就是其中一种。
 # 第3章 内核是如何与用户进程协作的
+- 同步阻塞的开销？
+- 多路复用epoll为什么提高网络性能？
+- epoll也阻塞？为什么还是高性能。
+- 为什么redis的网络性能很突出？
+## socket的直接创建
+![img](linux网络.assets/D6B5E2DE80134B6BDEDD04C8DD0A127C.jpg)
+以上就是socket的内核结构表示。**当软中断上收到数据包时会通过调用sk_data_ready函数指针->sock_def_readable()来唤醒在sock上等待的进程**。socket的创建花费一次系统调用的开销。
+## 内核和用户进程协作之阻塞方式
+同步阻塞：使用方便，性能较差，如下图：
+![image-20231207104517944](linux网络.assets/image-20231207104517944.png)
+### 等待接收消息
+![image-20231207105019866](linux网络.assets/image-20231207105019866.png)
+- 首先用户进程调用recv，实质调用recvfrom系统调用。
+- 访问socket内核对象的ops，调用inet_recvmsg()->访问sock内核对象的sk_prot的tcp_recvmsg()。
+- 遍历接收队列，如果没有足够的数据，那么就会调用sk_wait_data阻塞当前进程。
+阻塞细节：注册了等待队列项wait;首先将当前进程的current关联新的注册的新的回调函数autoremove_wake_function中;找出socket的等待队列（理解为同一类等待事件队列）;插入wait项到socket等待队列中，修改当前进程的状态（运行态到阻塞态）
+- ==内核在收完数据后即产生就绪事件时，查找等待队列，找到对应的回调函数和进程==，调用sk_wait_event让出cpu，有一次进程上下文的切换。
+
+### 软中断模块
+![image-20231207115423442](linux网络.assets/image-20231207115423442.png)
+如上图所示，软中断收skb包，走ip处理函数流程后，tcp数据包则走tcp处理函数；保存数据到socket的接收队列中，唤醒等待队列（调用前面socket创建的内核对象sock的sock_def_readable()）上的进程。
+```c
+//file: net/ipv4/tcp_input.c
+int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+   const struct tcphdr *th, unsigned int len)
+{
+ ......
+
+ //接收数据到队列中
+ eaten = tcp_queue_rcv(sk, skb, tcp_header_len,
+            &fragstolen);
+
+ //数据 ready，唤醒 socket 上阻塞掉的进程
+sk->sk_data_ready(sk, 0);
+}
+
+//tcp_queue_rcv()函数
+//file: net/ipv4/tcp_input.c
+static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int hdrlen,
+    bool *fragstolen)
+{
+ //把接收到的数据放到 socket 的接收队列的尾部
+ if (!eaten) {
+  __skb_queue_tail(&sk->sk_receive_queue, skb);
+  skb_set_owner_r(skb, sk);
+ }
+ return eaten;
+}
+
+//sk_data_ready()函数即对应sock_def_readale()函数
+//file: net/core/sock.c
+static void sock_def_readable(struct sock *sk, int len)
+{
+ struct socket_wq *wq;
+
+ rcu_read_lock();
+ wq = rcu_dereference(sk->sk_wq);
+
+ //有进程在此 socket 的等待队列
+ if (wq_has_sleeper(wq))
+  //唤醒等待队列上的进程
+  wake_up_interruptible_sync_poll(&wq->wait, POLLIN | POLLPRI |
+      POLLRDNORM | POLLRDBAND);
+ sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
+ rcu_read_unlock();
+}
+
+// wake_up_interruptible_sync_poll()来唤醒，具体函数
+//file: kernel/sched/core.c
+void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode,
+   int nr_exclusive, void *key)
+{
+ unsigned long flags;
+ int wake_flags = WF_SYNC;
+
+ if (unlikely(!q))
+  return;
+
+ if (unlikely(!nr_exclusive))
+  wake_flags = 0;
+
+ spin_lock_irqsave(&q->lock, flags);
+ __wake_up_common(q, mode, nr_exclusive, wake_flags, key);
+ spin_unlock_irqrestore(&q->lock, flags);
+}
+
+//wake_up_common
+//file: kernel/sched/core.c
+static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+   int nr_exclusive, int wake_flags, void *key)
+{
+ wait_queue_t *curr, *next;
+
+ list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+  unsigned flags = **curr**->flags;
+
+  if (curr->func(curr, mode, wake_flags, key) &&
+    (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+   break;
+ }
+}
+//wake_up_common实现唤醒进程，nr_exclusive为1，表示即使多个进程阻塞在同一socket上，也只唤醒一个进程，避免“惊群”效应.在对应的socket的等待队列中找到一个curr等待项，调用curr->func即前面的autoremove_wake_function中。然后走到default_wake_function（）
+//file: kernel/sched/core.c
+int default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags,
+     void *key)
+{
+ return try_to_wake_up(curr->private, mode, wake_flags);
+}
+//这里的curr->private即前面所述的当前进程，即对应的进程。这个执行完成后：
+//socket上等待而阻塞的进程被推入运行队列了，会产生一次切换进程上下文的开销。
+```
+### 同步阻塞总结
+两次进程上下文切换，一次用户进程阻塞用户态到阻塞态。一次就绪，阻塞态到用户态。**==一次上下文切换大概几微秒==**。
+这种同步阻塞模式基本无法在现在的实际需求下使用，即使是客户端。所以需要更加高效的网路模式，即下面的select，poll，epoll模式。
 
