@@ -988,7 +988,7 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
  wait_queue_t *curr, *next;
 
  list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
-  unsigned flags = **curr**->flags;
+  unsigned flags = curr->flags;
 
   if (curr->func(curr, mode, wake_flags, key) &&
     (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
@@ -1008,4 +1008,164 @@ int default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags,
 ### 同步阻塞总结
 两次进程上下文切换，一次用户进程阻塞用户态到阻塞态。一次就绪，阻塞态到用户态。**==一次上下文切换大概几微秒==**。
 这种同步阻塞模式基本无法在现在的实际需求下使用，即使是客户端。所以需要更加高效的网路模式，即下面的select，poll，epoll模式。
+## 内核和用户进程协作之epoll
+### epoll内核对象的创建
+![image-20231208095926432](linux网络.assets/image-20231208095926432.png)
+上图中，epoll_create时，内核创建一个struct eventpoll的内核对象，并将其关联到当前进程的已打开文件列表中。
+![image-20231208101540136](linux网络.assets/image-20231208101540136.png)
+eventpoll在file结构中的private_data中，而file是打开文件表中的一项。
+eventpoll对应有wait_queue_head_t(即等待队列)：软中断数据就绪的时候会通过 wq 来找到阻塞在 epoll 对象上的用户进程。
+list_head(即就绪队列)：当有的连接就绪的时候，内核会把就绪的连接放到 rdllist 链表里。这样应用进程只需要判断链表就能找出就绪进程，而不用去遍历整棵树。
+rb_root（即红黑树）：为了支持对海量连接的高效查找、插入和删除，eventpoll 内部使用了一棵红黑树。通过这棵树来管理用户进程下添加进来的所有 socket 连接。
+```c
+//file: fs/eventpoll.c
+static int ep_alloc(struct eventpoll **pep)
+{
+    struct eventpoll *ep;
 
+    //申请 epollevent 内存
+    ep = kzalloc(sizeof(*ep), GFP_KERNEL);
+
+    //初始化等待队列头
+    init_waitqueue_head(&ep->wq);
+
+    //初始化就绪列表
+    INIT_LIST_HEAD(&ep->rdllist);
+
+    //初始化红黑树指针
+    ep->rbr = RB_ROOT;
+
+    ......
+}
+```
+### ==为epoll添加socket==
+事先分配好socket，已经创建好eventpoll对象。如下图为epoll添加两个socket的进程：
+![image-20231208104124312](linux网络.assets/image-20231208104124312.png)
+```c
+// file：fs/eventpoll.c
+SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+        struct epoll_event __user *, event)
+{
+    struct eventpoll *ep;
+    struct file *file, *tfile;
+
+    //根据 epfd 找到 eventpoll 内核对象
+    file = fget(epfd);
+    ep = file->private_data;
+
+    //根据 socket 句柄号， 找到其 file 内核对象
+    tfile = fget(fd);
+
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (!epi) {
+            epds.events |= POLLERR | POLLHUP;
+            error = ep_insert(ep, &epds, tfile, fd);
+        } else
+            error = -EEXIST;
+        clear_tfile_check_list();
+        break;
+}
+}
+
+//对于ep_insert函数，所有注册在这个函数中完成
+//file: fs/eventpoll.c
+static int ep_insert(struct eventpoll *ep, 
+                struct epoll_event *event,
+                struct file *tfile, int fd)
+{
+    //3.1 分配并初始化 epitem
+    //分配一个epi对象
+    struct epitem *epi;
+    if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
+        return -ENOMEM;
+
+    //对分配的epi进行初始化
+    //epi->ffd中存了句柄号和struct file对象地址
+    INIT_LIST_HEAD(&epi->pwqlist);
+    epi->ep = ep;//设置epitem的指针指向内核的eventpoll。
+    ep_set_ffd(&epi->ffd, tfile, fd);//将套接字的句柄和file传递给epitem对象的ffd。
+
+    //3.2 设置 socket 等待队列
+    //定义并初始化 ep_pqueue 对象
+    struct ep_pqueue epq;
+    epq.epi = epi;
+    init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+    //调用 ep_ptable_queue_proc 注册回调函数 
+    //实际注入的函数为 ep_poll_callback
+    revents = ep_item_poll(epi, &epq.pt);
+
+    ......
+    //3.3 将epi插入到 eventpoll 对象中的红黑树中
+    ep_rbtree_insert(ep, epi);
+    ......
+}
+
+```
+针对ep_insert()函数
+- 分配并初始化epitem， 即对epitem的值进行初始化。（主要是epitem的ffd的值设置为socket的fd和file句柄，以及ep指向eventpoll对象）
+- 设置socket的等待队列，将ep_poll_callback设置为数据就绪时的回调函数。
+![image-20231208111758702](linux网络.assets/image-20231208111758702.png)
+如上图，实质上是获取在socket的sock对象下的等待队列的表头wait_queue_head_t,然后以后等待队列项就插入到这个等待队列（==值得注意的是这个等待队列是socket的，而不是epfd的==）。
+前面介绍的是等待队列项的private会被设置为当前进程的current，但这里不再需要设置，因为socket是由epoll来进行管理的。
+软中断将数据送到socket的接收队列后，通过注册的回调函数通知epoll对象。
+- 插入红黑树，即再分配完epitem对象后，将其插入红黑树。为什么红黑树？红黑树可以让epoll在查找效率，插入效率，内存开销等多方面较为均衡。
+### epoll_wait等待接收
+epoll_wait观察eventpoll->rdllist里有没有数据，无数据就创建一个等待队列项，将其添加到eventpoll的等待队列上，然后阻塞掉自己。
+![image-20231208114403133](linux网络.assets/image-20231208114403133.png)
+如上图主要有四步操作：
+- 检查就绪队列上是否有就绪的socket，ep_events_avaliable()判断有没有可处理事件。
+- 定义等待事件并关联到当前进程，设置等待队列项。
+- 将等待队列项插入eventpoll的等待队列中（因为可能多个进程监听同一个epfd，所以需要等待队列，会引发epoll惊群效应）
+- 让出cpu，开始进行睡眠。
+
+### 数据来了
+![image-20231208115225305](linux网络.assets/image-20231208115225305.png)
+epoll涉及的各个回调函数：
+- 在socket的sock的sk_data_ready()函数这里，设置就绪处理函数：sock_def_readable
+- 在socket的等待队列中，设置回调函数ep_poll_callback,private设置为NULL
+- 在epoll的等待队列中，设置回调函数default_wake_function,private设置为current。
+**将数据接收到接收队列**
+网卡收到数据->dma传送，硬软中断，走ip->tcp协议处理，走前面的路子，将数据放到socket的接收队列。
+**查找就绪回调函数**
+大部分类似与3.1节，但是呢，这里的sock_def_readable往下走的调用栈到wake_up_common这里，只是找到等待项的回调函数ep_poll_callback,而不用关系等待项的进程项，因为回调函数不一定有唤醒进程的操作。
+**执行socket的就绪回调函数**
+```c
+//file: fs/eventpoll.c
+static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *key)
+{
+    //获取 wait 对应的 epitem
+    struct epitem *epi = ep_item_from_wait(wait);
+
+    //获取 epitem 对应的 eventpoll 结构体
+    struct eventpoll *ep = epi->ep;
+
+    //1. 将当前epitem 添加到 eventpoll 的就绪队列中
+    list_add_tail(&epi->rdllink, &ep->rdllist);
+
+    //2. 查看 eventpoll 的等待队列上是否有在等待
+    if (waitqueue_active(&ep->wq))
+        wake_up_locked(&ep->wq);
+}
+//大致流程是通过等待任务项的base指针找到对应的epitem项，然后找到对应的eventpoll，将当前的epitem放入到eventpoll的就绪队列上。
+//最后会检查eventpoll的等待队列是否有等待项，有的话就递归调用到对应项的回调函数default_wake_function，并且唤醒进程。
+```
+**执行epoll就绪通知**
+default_wake_function,通过curr->private唤醒相应进程。此后进程推入可运行队列，并可以被重新调度运行。在用户方看来，进程只是从epoll_wait阻塞处继续执行，并且返回eventpoll的rdlist中的就绪事件。
+
+### 小结
+![image-20231208150239142](linux网络.assets/image-20231208150239142.png)
+在实际运用中，一般epoll_wait不会阻塞，只要客户端的活够多。服务端的活就多。
+- 阻塞到底怎么回事？
+进程因为等待某个事件而主动让出cpu的操作。
+- 同步阻塞IO的开销?
+每阻塞一次就需要两次进程的上下文切换，同步阻塞一个进程同时只能等待一条连接。所以服务端已没人用同步阻塞IO
+- 多路epoll为什么提高网络性能？
+极大程度的减少了无用的进程上下文切换以及让进程更专注处理网络请求。
+- epoll也是阻塞的？
+没错，epoll_wait没有就绪事件时，进程就会阻塞在这里，但是连接这么多请求都没就绪的，这个阻塞并不影响性能。
+为什么redis的网络性能突出？
+redis的主要业务逻辑是在本机内存上的数据的读写，几乎无网络，硬盘IO。主服务程序做成单线程（如果实在有更高的性能需求，Redis6.0开始支持多线程版本了），避免不必要的进程上下文切换和IPC通信代价。
+**很多的服务和网络IO框架一般采用多进程配合，如谁来等待事件，谁来处理事件，谁来发送结果。即大家常说的Reactor和Proactor模型**。
+# 第4章  内核如何发送网络包
