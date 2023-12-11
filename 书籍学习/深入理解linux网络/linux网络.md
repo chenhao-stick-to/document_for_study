@@ -1168,4 +1168,225 @@ default_wake_function,通过curr->private唤醒相应进程。此后进程推入
 为什么redis的网络性能突出？
 redis的主要业务逻辑是在本机内存上的数据的读写，几乎无网络，硬盘IO。主服务程序做成单线程（如果实在有更高的性能需求，Redis6.0开始支持多线程版本了），避免不必要的进程上下文切换和IPC通信代价。
 **很多的服务和网络IO框架一般采用多进程配合，如谁来等待事件，谁来处理事件，谁来发送结果。即大家常说的Reactor和Proactor模型**。
+
 # 第4章  内核如何发送网络包
+## 相关实际问题
+- 查看内核发送数据消耗的CPU，看sy还是si？
+- 查看/proc/softirqs，net_rx比net_tx大得多？
+- 发送网络数据涉及那些内存拷贝？
+- 零拷贝的工作机理
+- Kafka性能突出？为什么？
+## 网络包收发过程总览
+![image-20231211142915462](linux网络.assets/image-20231211142915462.png)
+源码角度的流程图：
+![image-20231211144010471](linux网络.assets/image-20231211144010471.png)
+![image-20231211144034242](linux网络.assets/image-20231211144034242.png)
+![image-20231211144054564](linux网络.assets/image-20231211144054564.png)
+以上是经过用户进程应用层到系统调用，再到协议栈，经过tcp，ip协议包装，再到邻居子系统（链路层进行skb到传输队列）；经过网络设备子系统，选择传输队列发送到硬件，硬件再调用驱动程序实际发送数据的过程。
+实际发送数据完成，需要释放缓存队列内存等。如下
+![image-20231211145520706](linux网络.assets/image-20231211145520706.png)
+==这里有一个比较重要的地方是，硬中断触发的是net_rx软中断，然后再调用驱动执行发送完成操作，清除tx_buffer。所以这里是为什么net_rx比net_tx要大很多的原因之一==
+## 网卡驱动准备
+和内核接收数据一样，在启动网卡的时候，igb_open（）函数中，需要分配传输队列。
+```c
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+int igb_setup_tx_resources(struct igb_ring *tx_ring)
+{
+ //1.申请 igb_tx_buffer 数组内存
+ size = sizeof(struct igb_tx_buffer) * tx_ring->count;
+ tx_ring->tx_buffer_info = vzalloc(size);
+
+ //2.申请 e1000_adv_tx_desc DMA 数组内存
+ tx_ring->size = tx_ring->count * sizeof(union e1000_adv_tx_desc);
+ tx_ring->size = ALIGN(tx_ring->size, 4096);
+ tx_ring->desc = dma_alloc_coherent(dev, tx_ring->size,
+        &tx_ring->dma, GFP_KERNEL);
+
+ //3.初始化队列成员
+ tx_ring->next_to_use = 0;
+ tx_ring->next_to_clean = 0;
+}
+//这里主要发送队列的数组有两种，一种是dma用的数组内存，一种是内核用的数组内存。
+//内核用的指针数组在协议栈处理出来后，在邻居设备子系统进行处理成skb挂到传输队列上，后面在网络设备子系统时，用dma的bd数组将传输队列的skb发送到网卡。
+```
+## 数据从用户进程到网卡的详细过程
+### send系统调用的实现
+- 在内核把真的socket找出来，其记录了各协议栈函数地址
+- 构造一个msghdr对象，传入用户数据，如buffer的地址，数据长度。
+![image-20231211155940416](linux网络.assets/image-20231211155940416.png)
+如上图，首先send系统调用调用真正的sendto系统调用，然后找到对应的socket，构造msghdr对象。对应socket可依次调用ops的inet_sendmsg（）函数，再调用sk_prot的tcp等协议栈函数。
+```c
+SYSCALL_DEFINE4(send, int, fd, void __user *, buff, size_t, len,
+  unsigned int, flags)
+{
+ return sys_sendto(fd, buff, len, flags, NULL, 0);
+}
+
+SYSCALL_DEFINE6(......)
+{
+ //1.根据 fd 查找到 socket
+ sock = sockfd_lookup_light(fd, &err, &fput_needed);
+
+ //2.构造 msghdr
+ struct msghdr msg;
+ struct iovec iov;
+
+ iov.iov_base = buff;
+ iov.iov_len = len;
+ msg.msg_iovlen = 1;
+
+ msg.msg_iov = &iov;
+ msg.msg_flags = flags;
+ ......
+//前面两步即完成了通过fd找到对应的socket，以及完成了对用户数据的封装为msghdr
+ //3.发送数据
+ sock_sendmsg(sock, &msg, len);//最后发送数据，其实是调用sock->ops->sendmsg,即inet_sendmsg()函数。
+}
+```
+### 传输层处理
+#### 传输层拷贝
+inet_sendmsg()函数中，会调用socket的对应的协议处理函数，对于tcp就是tcp_senmsg()。
+![image-20231211162027121](linux网络.assets/image-20231211162027121.png)
+```c
+//file: net/ipv4/af_inet.c
+int inet_sendmsg(......)
+{
+ ......
+ return sk->sk_prot->sendmsg(iocb, sk, msg, size);//tcp则调用tcp_sendmsg（）函数
+}
+
+//tcp_sendmsg()函数
+
+//file: net/ipv4/tcp.c
+int tcp_sendmsg(...)
+{
+ while(...){
+  while(...){
+   //获取发送队列
+   skb = tcp_write_queue_tail(sk);
+
+   //申请skb 并拷贝
+   ......
+  }
+ }
+}
+//file: include/net/tcp.h这个函数主要是获取socket的发送队列
+static inline struct sk_buff *tcp_write_queue_tail(const struct sock *sk)
+{
+ return skb_peek_tail(&sk->sk_write_queue);
+}
+
+//file: net/ipv4/tcp.c
+int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+  size_t size)
+{
+ //获取用户传递过来的数据和标志
+ iov = msg->msg_iov; //用户数据地址
+ iovlen = msg->msg_iovlen; //数据块数为1
+ flags = msg->msg_flags; //各种标志
+
+ //遍历用户层的数据块
+ while (--iovlen >= 0) {
+
+  //待发送数据块的地址
+  unsigned char __user *from = iov->iov_base;
+
+  while (seglen > 0) {
+
+   //需要申请新的 skb
+   if (copy <= 0) {
+
+    //申请 skb，并添加到发送队列的尾部
+    skb = sk_stream_alloc_skb(sk,
+         select_size(sk, sg),
+         sk->sk_allocation);
+
+    //把 skb 挂到socket的发送队列上
+    skb_entail(sk, skb);
+   }
+
+   // skb 中有足够的空间
+   if (skb_availroom(skb) > 0) {
+    //拷贝用户空间的数据到内核空间，同时计算校验和
+    //from是用户空间的数据地址 
+    skb_add_data_nocache(sk, skb, from, copy);
+   } 
+   ......
+  }
+ }
+}
+```
+如下面的流程，其实是获取socket的等待队列的最后一个skb，然后将用户空间的数据拷贝到这个新的skb（这里就有一次或者几次内存拷贝）。如果需要申请新的skb（剩余空间不足），就可将新申请的skb挂到发送队列的尾部
+![image-20231211170228222](linux网络.assets/image-20231211170228222.png)
+下面是何时内核将skb的写队列发送出去：
+```c
+//file: net/ipv4/tcp.c
+int tcp_sendmsg(...)
+{
+ while(...){
+  while(...){
+   //申请内核内存并进行拷贝
+
+   //发送判断
+   if (forced_push(tp)) {//未发送数据超过最大窗口的一半，则立即发送数据
+    tcp_mark_push(tp, skb);
+    __tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
+   } else if (skb == tcp_send_head(sk))//判断skb是否为第一个待发送队列的skb，是就立即推送数据，主要用在实时性要求较高的场景中
+    tcp_push_one(sk, mss_now);  
+   }
+   continue;
+  }
+ }
+}//当以上条件均没有满足的时候，这次只是将用户的要发送数据拷贝到内核结束
+```
+#### 传输层发送
+上面的tcp_write_xmit和tcp_push_one，==最终都会执行tcp_write_xmit（）函数，这个函数主要处理拥塞控制，滑动窗口的相关工作==。
+```c
+//file: net/ipv4/tcp_output.c
+static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+      int push_one, gfp_t gfp)
+{
+ //循环获取待发送 skb
+ while ((skb = tcp_send_head(sk))) 
+ {
+  //滑动窗口相关
+  cwnd_quota = tcp_cwnd_test(tp, skb);
+  tcp_snd_wnd_test(tp, skb, mss_now);
+  tcp_mss_split_point(...);
+  tso_fragment(sk, skb, ...);
+  ......
+
+  //真正开启发送
+  tcp_transmit_skb(sk, skb, 1, gfp);
+ }
+}
+
+//下面是真正发送的主过程
+//file: net/ipv4/tcp_output.c
+static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+    gfp_t gfp_mask)
+{
+ //1.克隆新 skb 出来
+ if (likely(clone_it)) {
+  skb = skb_clone(skb, gfp_mask);
+  ......
+ }
+
+ //2.封装 TCP 头
+ th = tcp_hdr(skb);
+ th->source  = inet->inet_sport;
+ th->dest  = inet->inet_dport;
+ th->window  = ...;
+ th->urg   = ...;
+ ......
+
+ //3.调用网络层发送接口
+ err = icsk->icsk_af_ops->queue_xmit(skb, &inet->cork.fl);//这里其实是调用了ip层的ip_queue_xmit函数
+}
+//克隆skb，原因是后续网卡发送完成，skb会被释放掉，tcp支持丢失重传，收到对方ack前，skb不能释放.只有收到ack才会真正删除
+//修改skb中的tcp头
+```
+如下图的大致流程：
+![image-20231211173932114](linux网络.assets/image-20231211173932114.png)
+下面是发送函数的第二件事修改skb的tcp头，skb中有所有协议的头，在设置tcp头时，只需要将指针指向skb的合适的位置。
+![image-20231211174440081](linux网络.assets/image-20231211174440081.png)
