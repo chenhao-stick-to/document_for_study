@@ -1390,3 +1390,406 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 ![image-20231211173932114](linux网络.assets/image-20231211173932114.png)
 下面是发送函数的第二件事修改skb的tcp头，skb中有所有协议的头，在设置tcp头时，只需要将指针指向skb的合适的位置。
 ![image-20231211174440081](linux网络.assets/image-20231211174440081.png)
+### 网络层发送处理
+网络层主要处理的事：路由项查找，ip头设置，netfilter过滤，skb切分（大于MTU）等
+![image-20231212092833459](linux网络.assets/image-20231212092833459.png)
+对应的源码：
+```c
+//file: net/ipv4/ip_output.c
+int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+{
+ //检查 socket 中是否有缓存的路由表
+ rt = (struct rtable *)__sk_dst_check(sk, 0);
+ if (rt == NULL) {
+  //没有缓存则展开查找
+  //则查找路由项， 并缓存到 socket 中
+  rt = ip_route_output_ports(...);
+  sk_setup_caps(sk, &rt->dst);
+ }
+
+ //为 skb 设置路由表
+ skb_dst_set_noref(skb, &rt->dst);
+
+ //设置 IP header
+ iph = ip_hdr(skb);
+ iph->protocol = sk->sk_protocol;
+ iph->ttl      = ip_select_ttl(inet, &rt->dst);
+ iph->frag_off = ...;
+
+ //发送
+ ip_local_out(skb);
+}
+```
+首先路由项查找和设置，先在socket查找路由表地址，无则展开查找。找到后需要缓存路由项到socket，然后为skb设置路由表，将路由表地址存储在skb中。然后定位skb的ip头的位置并且设置ip头。
+```c
+//file: net/ipv4/ip_output.c  
+int ip_local_out(struct sk_buff *skb)
+{
+ //执行 netfilter 过滤
+ err = __ip_local_out(skb);
+//iptables配置了规则，这里将会检测规则。如果设置了非常负责的netfilter规则，这个函数将导致进程cpu开销大增。
+ //开始发送数据
+ if (likely(err == 1))
+  err = dst_output(skb);
+ ......
+}
+
+//如下面，这里找到skb的路由表，调用路由表的output方法。就是一个函数指针指向ip_output()函数
+//file: include/net/dst.h
+static inline int dst_output(struct sk_buff *skb)
+{
+ return skb_dst(skb)->output(skb);
+}
+//file: net/ipv4/ip_output.c
+int ip_output(struct sk_buff *skb)
+{
+ //统计
+ .....
+
+ //再次交给 netfilter，完毕后回调 ip_finish_output，然后执行ip_finish_output2，目的是发送过程进入下一层邻居子系统
+ return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING, skb, NULL, dev,
+    ip_finish_output,
+    !(IPCB(skb)->flags & IPSKB_REROUTED));
+}
+
+//这里调用ip_finish_output，首先和mtu比较，判断skb是否执行分片。
+//file: net/ipv4/ip_output.c
+static int ip_finish_output(struct sk_buff *skb)
+{
+ //大于 mtu 的话就要进行分片了
+ if (skb->len > ip_skb_dst_mtu(skb) && !skb_is_gso(skb))
+  return ip_fragment(skb, ip_finish_output2);
+ else
+  return ip_finish_output2(skb);
+}
+
+//file: net/ipv4/ip_output.c
+static inline int ip_finish_output2(struct sk_buff *skb)
+{
+ //根据下一跳 IP 地址查找邻居项，找不到就创建一个
+ nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);  
+ neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+ if (unlikely(!neigh))
+  neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
+
+ //继续向下层传递
+ int res = dst_neigh_output(dst, neigh, skb);
+}
+```
+qq早期，尽量控制数据包尺寸小于mtu。分片带来的问题：
+- 额外切分处理，有性能开销
+- 一个分片丢失，整个skb需要重传。
+### 邻居子系统
+位于网络层和数据链路层中间的一个系统。为网络层提供下层封装。
+![image-20231212104205724](linux网络.assets/image-20231212104205724.png)
+邻居子系统主要查找/创建邻居项，创建邻居项会发送实际arp请求。
+```c
+//file: include/net/arp.h
+//下面是ip_finish_output2的调用的ipv4_neigh_lookup_noref()函数，主要实现的是在arp缓存中查找，传入的是路由的下一跳的ip地址信息。
+extern struct neigh_table arp_tbl;
+static inline struct neighbour *__ipv4_neigh_lookup_noref(
+ struct net_device *dev, u32 key)
+{
+ struct neigh_hash_table *nht = rcu_dereference_bh(arp_tbl.nht);
+
+ //计算 hash 值，加速查找
+ hash_val = arp_hashfn(......);
+ for (n = rcu_dereference_bh(nht->hash_buckets[hash_val]);
+   n != NULL;
+   n = rcu_dereference_bh(n->next)) {
+  if (n->dev == dev && *(u32 *)n->primary_key == key)
+   return n;
+ }
+}
+
+//但是如果在arp缓存中未找到，就需要创建一个邻居。
+//file: net/core/neighbour.c
+struct neighbour *__neigh_create(......)
+{
+ //申请邻居表项
+ struct neighbour *n1, *rc, *n = neigh_alloc(tbl, dev);
+
+ //构造赋值
+ memcpy(n->primary_key, pkey, key_len);
+ n->dev = dev;
+ n->parms->neigh_setup(n);
+
+ //最后添加到邻居 hashtable 中,这里将邻居项添加到了arp的hashtable中，但是表项的值还没有具体值，因为mac地址还未获取
+ rcu_assign_pointer(nht->hash_buckets[hash_val], n);
+ ......
+}
+
+//调用dest_neigh_output继续传递skb，
+//file: include/net/dst.h
+static inline int dst_neigh_output(struct dst_entry *dst, 
+     struct neighbour *n, struct sk_buff *skb)
+{
+ ......
+ return n->output(n, skb);//实际指向的是neigh_resolve_output（）函数
+}
+//file: net/core/neighbour.c
+int neigh_resolve_output(){
+
+ //注意：这里可能会触发 arp 请求，这里当arp缓存没有对应邻居项时，触发arp请求（arp协议），获取下一条ip地址的对应的mac地址
+ if (!neigh_event_send(neigh, skb)) {
+
+  //neigh->ha 是 MAC 地址
+  dev_hard_header(skb, dev, ntohs(skb->protocol),
+           neigh->ha, NULL, skb->len);//将mac地址封装到skb的mac头中
+  //发送
+  dev_queue_xmit(skb);//将skb传递给linux网络设备子系统
+ }
+}
+```
+### 网络设备子系统、
+![image-20231212112840749](linux网络.assets/image-20231212112840749.png)
+```c
+//file: net/core/dev.c 
+int dev_queue_xmit(struct sk_buff *skb)
+{
+ //选择发送队列,网卡可能有多个发送队列，选一个队列来进行发送
+ txq = netdev_pick_tx(dev, skb);
+
+ //获取与此队列关联的排队规则
+ q = rcu_dereference_bh(txq->qdisc);
+
+ //如果有队列，则调用__dev_xmit_skb 继续处理数据
+ if (q->enqueue) {
+  rc = __dev_xmit_skb(skb, q, dev, txq);
+  goto out;
+ }
+
+ //没有队列的是回环设备和隧道设备
+ ......
+}
+
+//下面进行等待队列的规则寻找，根据用户的XPS配置来选择队列，否则自动计算
+u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb)
+{
+ //获取 XPS 配置
+ int new_index = get_xps_queue(dev, skb);
+
+ //自动计算队列
+ if (new_index < 0)
+  new_index = skb_tx_hash(dev, skb);}
+
+//下面dev_xmit_skb处理数据，分为可以绕开排队系统和正常排队两种
+//file: net/core/dev.c
+static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+     struct net_device *dev,
+     struct netdev_queue *txq)
+{
+ //1.如果可以绕开排队系统
+ if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+     qdisc_run_begin(q)) {
+  ......
+ }
+
+ //2.正常排队
+ else {
+
+  //入队，先将skb按照排队规则入选中的发送队列的队
+  q->enqueue(skb, q)
+
+  //开始发送
+  __qdisc_run(q);
+ }
+}
+
+//while循环不对的取出发送队列中的skb来进行发送，主要占用的时用户进程的系统态时间sy。当quota用尽或者其他进程需要cpu，则触发软中断，延后处理。
+//file: net/sched/sch_generic.c
+void __qdisc_run(struct Qdisc *q)
+{
+ int quota = weight_p;//这个配额的作用是限制在一定时间内可以发送的数据包数量或发送的数据量，可用于实现流量控制，拥塞控制。
+
+ //循环从队列取出一个 skb 并发送
+ while (qdisc_restart(q)) {
+  
+  // 如果发生下面情况之一，则延后处理：
+  // 1. quota 用尽
+  // 2. 其他进程需要 CPU
+  if (--quota <= 0 || need_resched()) {
+   //将触发一次 NET_TX_SOFTIRQ 类型 softirq
+   __netif_schedule(q);
+   break;
+  }
+ }
+}
+```
+如上代码所述，在将这个循环里，只有当quota用尽或者是其他进程需要调度时，才会触发net_tx软中断来进行延后处理。而其他只会占用用户进程的系统态时间。==**对于接收来说，都需要经过net_rx软中断，但是对于发送来说，只是当quota用尽或者其他进程需要调度时才会触发net_tx软中断，这是第二个服务器上net_rx比net_tx要多的原因**==。
+```c
+static inline int qdisc_restart(struct Qdisc *q)//这里是否是将发送队列的skb数据发送到网卡？？？？
+{
+ //从 qdisc 中取出要发送的 skb
+ skb = dequeue_skb(q);
+ ...
+
+ return sch_direct_xmit(skb, q, dev, txq, root_lock);
+}
+//file: net/sched/sch_generic.c
+int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
+   struct net_device *dev, struct netdev_queue *txq,
+   spinlock_t *root_lock)
+{
+ //调用驱动程序来发送数据
+ ret = dev_hard_start_xmit(skb, dev, txq);
+}
+```
+### 软中断调度
+发送网络包是系统态的cpu用尽或者其他进程需要调度，调用__netif_reschedule()函数来触发一次软中断。
+![image-20231212145158353](linux网络.assets/image-20231212145158353.png)
+```c
+//file: net/core/dev.c
+static inline void __netif_reschedule(struct Qdisc *q)
+{
+ sd = &__get_cpu_var(softnet_data);//
+ q->next_sched = NULL;
+ *sd->output_queue_tailp = q;
+ sd->output_queue_tailp = &q->next_sched;
+ ......
+ raise_softirq_irqoff(NET_TX_SOFTIRQ);
+}
+```
+软中断发送数据的处理是，首先是设置softnet_data的一个数据项output_queue为发送队列。触发软中断，执行软中断的处理函数。而执行这个处理函数的消耗的cpu记录在si里。
+```c
+//file: net/core/dev.c
+static void net_tx_action(struct softirq_action *h)
+{
+ //通过 softnet_data 获取发送队列
+ struct softnet_data *sd = &__get_cpu_var(softnet_data);
+
+ // 如果 output queue 上有 qdisc
+ if (sd->output_queue) {//这里获取的softnet_data的output_queue实际上是前面我们设置的发送队列。
+
+  // 将 head 指向第一个 qdisc
+  head = sd->output_queue;
+
+  //遍历 qdsics 列表
+  while (head) {
+   struct Qdisc *q = head;
+   head = head->next_sched;
+
+   //发送数据
+   qdisc_run(q);//和前面的进程用户态一样，走qdisc_restart,-》sch_direct_xmit-》dev_hard_start_xmit。
+  }
+ }
+}
+```
+### igb网卡驱动发送
+对于普通的用户进程的内核态或者是软中断处理的函数，最后都会走到dev_hard_start_xmit函数。
+![image-20231212153922763](linux网络.assets/image-20231212153922763.png)
+源码：
+```c
+//file: net/core/dev.c
+int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+   struct netdev_queue *txq)
+{
+ //获取设备的回调函数集合 ops
+ const struct net_device_ops *ops = dev->netdev_ops;
+
+ //获取设备支持的功能列表
+ features = netif_skb_features(skb);
+
+ //调用驱动的 ops 里面的发送回调函数 ndo_start_xmit 将数据包传给网卡设备
+ skb_len = skb->len;
+ rc = ops->ndo_start_xmit(skb, dev);//ndo_start_xmit是net_device_ops的一个实现的函数。对应了一个回调函数igb_xmit_frame.
+ //就像第二章中的ndo_open对应的是igb_open函数。
+}
+
+//下面这个函数在网卡驱动初始化的时候被赋值
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static netdev_tx_t igb_xmit_frame(struct sk_buff *skb,
+      struct net_device *netdev)
+{
+ ......
+ return igb_xmit_frame_ring(skb, igb_tx_queue_mapping(adapter, skb));
+}
+
+netdev_tx_t igb_xmit_frame_ring(struct sk_buff *skb,
+    struct igb_ring *tx_ring)
+{
+ //获取TX Queue 中下一个可用缓冲区信息
+ first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
+ first->skb = skb;
+ first->bytecount = skb->len;
+ first->gso_segs = 1;
+
+ //igb_tx_map 函数准备给设备发送的数据。这里是将发送队列的数据实际发送到网卡设备的发送缓冲区
+ igb_tx_map(tx_ring, first, hdr_len);
+}
+```
+![image-20231212160144977](linux网络.assets/image-20231212160144977.png)
+igb_tx_map主要的功能便是将ringbuffer上取下来的元素，并且将skb挂到上面的内核用的地址映射到网卡能够访问的内存dma区域。
+```c
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static void igb_tx_map(struct igb_ring *tx_ring,
+      struct igb_tx_buffer *first,
+      const u8 hdr_len)
+{
+ //获取下一个可用描述符指针
+ tx_desc = IGB_TX_DESC(tx_ring, i);
+
+ //为 skb->data 构造内存映射，以允许设备通过 DMA 从 RAM 中读取数据
+ dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+
+ //遍历该数据包的所有分片,为 skb 的每个分片生成有效映射
+ for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
+
+  tx_desc->read.buffer_addr = cpu_to_le64(dma);
+  tx_desc->read.cmd_type_len = ...;
+  tx_desc->read.olinfo_status = 0;
+ }
+
+ //设置最后一个descriptor
+ cmd_type |= size | IGB_TXD_DCMD;
+ tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
+
+ /* Force memory writes to complete before letting h/w know there
+  * are new descriptors to fetch
+  */
+ wmb();
+}
+```
+当所有描述符已建好，且skb的所有数据映射到dma地址后，驱动才会真正将dma的内存区域数据发送到网卡发送缓冲区。
+
+## ringbuffer内存回收
+数据从发送完成，工作还未结束，需要清理ringbuffer的内存。
+网卡触发一个硬中断，硬中断触发一个软中断net_rx_softirq。即走igb_poll->igb_clean_tx_irq.
+![image-20231212164101030](linux网络.assets/image-20231212164101030.png)
+==无论硬中断是有数据接收，还是发送完成的通知，都会触发net_rx_softirq的软中断==
+```c
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
+{
+ //free the skb
+ dev_kfree_skb_any(tx_buffer->skb);
+
+ //clear tx_buffer data
+ tx_buffer->skb = NULL;
+ dma_unmap_len_set(tx_buffer, len, 0);
+
+ // clear last DMA location and unmap remaining buffers */
+ while (tx_desc != eop_desc) {
+ }
+}
+//主要是清理skb数据，解除了dma数组的映射。skb并未真正删除，需要收到对方的ack后，skb才会真正删除。
+```
+## 本章总结
+![image-20231212164833653](linux网络.assets/image-20231212164833653.png)
+- 我们在监控内核发送数据消耗的cpu时，看sy还是si？
+发送过程中，90%以上的工作都是在用户进程内核态消耗掉的，除了触发软中断的情况，即这时消耗的是si。所以监控网络IO对服务器的cpu开销时，不仅看si，更应该将sy也考虑进来。
+- 服务器查看/proc/softirqs时，为什么net_rx要比net_tx大得多。
+第一个原因，在硬中断后，无论是接收数据还是发送完成的通知，都是触发的net_rx软中断。
+第二个原因，在网络设备子系统发送发送队列的数据到ringbuffer的时候，除了在配额时间quota用尽或者有其他进程需要调度的情况下，才会触发net_tx软中断；而大部分时间是可以直接使用用户进程的内核系统时间即sy来完成。而接收的情况则是接受一次，必触发一次net_rx软中断。
+- 发送网络数据的时候涉及那些内存拷贝工作？
+一是申请完skb，需要将msghdr的用户数据拷贝到skb中，数据量大是花销大。
+二是传输层到网络层需要拷贝skb，保存原始的skb，只进行浅拷贝，所指向的数据不进行拷贝。
+三是在ip判断mtu和skb的大小时，如果是需要分片，那么需要将一个skb拷贝为多个小的skb（不必要）
+- 零拷贝是怎样的？
+![img](linux网络.assets/A1F7C6F69D2D21478DB95A21914423B8.jpg)
+如上图所示，read硬盘上的数据来send的时候，首先需要从文件dma拷贝到pagecache，再从pagecache拷贝到用户进程的内存，然后用户进程内存再到socket的发送缓冲区，再往后走。。。
+但是零拷贝的实现是可以直接从pagecahe直接拷贝到socket的发送缓冲区，省略了两次拷贝到用户空间内存的拷贝，这个实现主要是通过sendfile来实现的。
+- 为什么kafka的效果很好？
+原因很多，其中之一就是使用了sendfile的系统调用来发送数据包。（节省了两次数据拷贝）
+
+# 第五章 深度理解本机网络IO
