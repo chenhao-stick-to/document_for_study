@@ -1793,3 +1793,196 @@ static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
 原因很多，其中之一就是使用了sendfile的系统调用来发送数据包。（节省了两次数据拷贝）
 
 # 第五章 深度理解本机网络IO
+# 相关实际问题
+- 127.0.0.1本机网络IO需要过网卡码？
+跨机网络需要网卡，但本机127.0.0.1通信需要经过网卡码？
+- 数据包在内核走向和外网发送相比流程上有什么差别？
+- 访问本机服务，使用127.0.0.1能比使用本机IP（192.168.x.x）快码？
+本机IO通信有两种方法，一是通过127.0.0.1；一是通过192.168.x.x。
+
+## 跨机网络通信过程
+![image-20231213100528497](linux网络.assets/image-20231213100528497.png)
+## 本机发送过程
+和跨机时有差别，主要是路由和驱动程序
+
+### 网络层路由
+![image-20231213103152118](linux网络.assets/image-20231213103152118.png)
+以上是网络层路由的大体过程。
+```c
+//file: net/ipv4/ip_output.c
+int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+{
+ //检查 socket 中是否有缓存的路由表
+ rt = (struct rtable *)__sk_dst_check(sk, 0);
+ if (rt == NULL) {
+  //没有缓存则展开查找
+  //则查找路由项， 并缓存到 socket 中
+  rt = ip_route_output_ports(...);//这里进行路由项的设置查找，->ip_route_output_flow->ip_route_output_key->fib_lookup函数
+  sk_setup_caps(sk, &rt->dst);
+ }
+}
+
+//获取1路由表，一是local，二是main
+//file:include/net/ip_fib.h
+static inline int fib_lookup(struct net *net, const struct flowi4 *flp,
+        struct fib_result *res)
+{
+ struct fib_table *table;
+
+ table = fib_get_table(net, RT_TABLE_LOCAL);//对于本机的IP，路由项在local就可以找到，所以这里之后就可以返回
+ if (!fib_table_lookup(table, flp, res, FIB_LOOKUP_NOREF))
+  return 0;
+
+ table = fib_get_table(net, RT_TABLE_MAIN);
+ if (!fib_table_lookup(table, flp, res, FIB_LOOKUP_NOREF))
+  return 0;
+ return -ENETUNREACH;
+}
+
+//file: net/ipv4/route.c
+struct rtable *__ip_route_output_key(struct net *net, struct flowi4 *fl4)
+{
+ if (fib_lookup(net, fl4, &res)) {//在local，main中查找目的ip的路由项
+ }
+ if (res.type == RTN_LOCAL) {//如果是本机的路由项，则使用本机的lo虚拟网卡
+  dev_out = net->loopback_dev;
+  ...
+ }
+
+ rth = __mkroute_output(&res, fl4, orig_oif, dev_out, flags);
+ return rth;
+}
+```
+后面网络层和跨机网络IO类似，进行netfilter过滤，需要分片（本机lo虚拟网卡的MTU比实际网卡eth要大得多，前者为65535，后者物理网一般是1500）也分片。
+### 本机IP路由
+本机ip用192.168.x.x和127.0.0.1在性能上有什么区别码？
+啮合在初始化local路由表是，将local所有的路由项设置为了RT_LOCAL，这样都会使用lo虚拟网卡。
+访问本机的IP(如192.168.x.x，127.0.0.1，以及本机的局域网ip地址)，使用的都是虚拟网卡lo，数据不需要经过物理网卡（但访问其他局域网的主机需要）。
+### 网络设备子系统
+前面已经说到。这里主要时选取发送队列，skb按排队规则入队，然后再出队并发送，可能触发软中断，延迟处理发送。
+但是对于本机的网络IO，因为是一个lo的回环设备，所以不存在队列的问题，所以直接进入dev_hard_start_xmit。
+```c
+//file: net/core/dev.c
+int dev_queue_xmit(struct sk_buff *skb)
+{
+ q = rcu_dereference_bh(txq->qdisc);
+ if (q->enqueue) {//回环设备这里为 false
+  rc = __dev_xmit_skb(skb, q, dev, txq);//前面的跨机IO，走这里的队列流程
+  goto out;
+ }
+
+ //开始回环设备处理
+ if (dev->flags & IFF_UP) {
+  dev_hard_start_xmit(skb, dev, txq, ...);//直接进入该函数走驱动程序来进行数据发送,这个函数可以通过dev来区分不同的网络设备，如虚拟网卡lo和物理网卡eth等
+  ...
+ }
+}
+
+
+//file: net/core/dev.c
+int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+   struct netdev_queue *txq)
+{
+ //获取设备驱动的回调函数集合 ops
+ const struct net_device_ops *ops = dev->netdev_ops;//获取对应网络设备的回调函数的集合
+
+ //调用驱动的 ndo_start_xmit 来进行发送
+ rc = ops->ndo_start_xmit(skb, dev);//这里会调用loopback设备的对应的回调函数，这里对应的时loopback_xmit
+ ...
+}
+
+//下面这个是对应的
+//file:drivers/net/loopback.c
+static const struct net_device_ops loopback_ops = {
+ .ndo_init      = loopback_dev_init,
+ .ndo_start_xmit= loopback_xmit,
+ .ndo_get_stats64 = loopback_get_stats64,
+};
+
+//使用loopback设备，则调用loopback_xmit的回调函数。
+//file:drivers/net/loopback.c
+static netdev_tx_t loopback_xmit(struct sk_buff *skb,
+     struct net_device *dev)
+{
+ //剥离掉和原 socket 的联系
+ skb_orphan(skb);
+
+ //调用netif_rx
+ if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {
+ }
+}
+```
+![image-20231213111546388](linux网络.assets/image-20231213111546388.png)
+如上图，在网络设备子系统这一层，直接通过dev_queue_xmit->dev_hard_start_xmit，最后再到驱动程序里的回调函数"loopback_xmit"
+如下图所示，loopback_xmit的大致做的事情：去除skb上的socket的指针，将其加入一个队列，再触发软中断。
+![image-20231213112951332](linux网络.assets/image-20231213112951332.png)
+==本机网络IO，传输层下面的skb可以不用释放，直接传输给接收方。==
+调用netif_rx->netif_rx_internal->enqueue_to_backlog
+```c
+//file: net/core/dev.c
+static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
+         unsigned int *qtail)
+{
+ sd = &per_cpu(softnet_data, cpu);//获取softnet_data
+
+ ...
+ __skb_queue_tail(&sd->input_pkt_queue, skb);//将skb加入到softnetdata里的input_pkt_queue中
+
+ ...
+ ____napi_schedule(sd, &sd->backlog);//调用napi_schedule来触发软中断
+}
+
+//file:net/core/dev.c
+static inline void ____napi_schedule(struct softnet_data *sd,
+         struct napi_struct *napi)
+{
+ list_add_tail(&napi->poll_list, &sd->poll_list);
+ __raise_softirq_irqoff(NET_RX_SOFTIRQ);//注意这里触发的是net_rx软中断，本质是因为不经过网卡，所以省略掉了硬中断，但是硬中断后面的软中断释放数据还是需要的。
+}
+```
+## 本机接收过程
+发送过程触发软中断
+![image-20231213115109010](linux网络.assets/image-20231213115109010.png)
+```c
+//对于igb网卡，poll实际调用igb_poll函数，对于loopback网卡，实际调用的是再net_dev_init函数里初始化softnetdata的poll的process_backlog函数
+//file: net/core/dev.c
+static void net_rx_action(struct softirq_action *h){
+ while (!list_empty(&sd->poll_list)) {
+  work = n->poll(n, weight);
+ }
+}
+
+//file:net/core/dev.c
+static int __init net_dev_init(void)
+{
+ for_each_possible_cpu(i) {
+  sd->backlog.poll = process_backlog;//softnet_data的poll默认初始化为process_backlog，而物理网卡一般会初始化为如igb_poll一样的处理函数
+ }
+}
+static int process_backlog(struct napi_struct *napi, int quota)
+{
+ while(){
+  while ((skb = __skb_dequeue(&sd->process_queue))) {//这里是将sd->process_queue的链表上的包取下来处理
+   __netif_receive_skb(skb);//送往协议栈
+  }
+
+  //skb_queue_splice_tail_init()函数用于将链表a连接到链表b上，
+  //形成一个新的链表b，并将原来a的头变成空链表。
+  qlen = skb_queue_len(&sd->input_pkt_queue);
+  if (qlen)
+   skb_queue_splice_tail_init(&sd->input_pkt_queue,
+         &sd->process_queue);
+ }
+}
+```
+如代码所示，在软中断处理函数，调用到注册的默认的poll函数，process_backlog.这里首先将softnetdata的process_queue的链表的数据取下来，然后通过netif_receive_sk发送到协议栈进行处理。后面则是将sd的process_queue的指针指向sd的input_pkt_queue,并且将input_pkt_queue释放掉。
+## 本章总结
+- 127.0.0.1本机网络IO需要经过网卡吗？
+不需要，因为在发送过程的网络层，选择路由项时会选择local路由项，这样后面就不会经过物理网卡，而是选择虚拟网卡lo。
+- 数据包在内核中什么走向，和外网发送相比流程区别？
+本机网络IO是需要ringbuffer等的驱动队列开销。但是本机则是直接将skb(发送端“驱动程序”保存到的softdata的input_pkt_queue,直接发送给接收端)。但是还是需要走网络协议栈，走邻居子系统，走网络设备层（即使在这一层，基本时直接过度到下一层，没有进行什么操作，下面到驱动程序层，这里没有对ringbuffer的操作，只是将skb挂到sd的input_pkt_queue上）
+==本机网络IO可以绕开协议栈的开销，但是需要动用eBPF，使用eBPF的sockmap和sk redirect（直接将一个套接字的数据重定向到另一个套接字）技术，达到真正不走协议栈==
+- 访问本机服务时，使用127.0.0.1和192.168.x.x更快吗
+5.3节可知，所有的本机IP会被初始化在本地的路由项中，最终都会走lo虚拟网卡，所以其实是没有差别的。都是走的虚拟网卡，走的数据路径都是一样的。
+# 第6章 深度理解TCP连接的建立过程
+
