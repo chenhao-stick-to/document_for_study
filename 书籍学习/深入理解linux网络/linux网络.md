@@ -2351,6 +2351,9 @@ int tcp_connect(struct sock *sk)
 **这里需要注意的是，如果ip_local_port_range中的很多端口都用了，那么很可能在执行connect调用时，需要循环执行多轮才能找到可用的端口，这将会导致connect系统调用的开销增加**
 如在connect之前，该socket使用了bind，则connect会使用bind的绑定的端口（==传入了端口则首先使用该端口，没有传入或传入0，还是会自动选择一个==，对于客户端的socket还是不建议使用bind进行绑定）。
 ## 完整tcp连接建立过程
+![image-20231214190938928](linux网络.assets/image-20231214190938928.png)
+### 服务端响应SYN
+服务端，所有TCP包包括客户端的SYN的握手请求经过网卡，软中断，再到tcp_v4_rcv。根据（skb）中的tcp头的信息的目的ip查到处于listen状态的socket（即socket的sock的），
+```c
 
-
-
+```
