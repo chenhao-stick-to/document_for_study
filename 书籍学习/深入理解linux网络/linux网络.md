@@ -2353,7 +2353,7 @@ int tcp_connect(struct sock *sk)
 ## 完整tcp连接建立过程
 ![image-20231214190938928](linux网络.assets/image-20231214190938928.png)
 ### 服务端响应SYN
-服务端，所有TCP包包括客户端的SYN的握手请求经过网卡，软中断，再到tcp_v4_rcv。根据（skb）中的tcp头的信息的目的ip查到处于listen状态的socket（即socket的sock的），
+服务端，所有TCP包括客户端的SYN的握手请求经过网卡，软中断，再到tcp_v4_rcv。根据（skb）中的tcp头的信息的目的ip查到处于listen状态的socket（即socket的sock的下面的inet_connection_sock的等待队列（包含全连接和半连接队列）），继续进入tcp_v4_so_rcv（）处理
 ```c
 
 ```
