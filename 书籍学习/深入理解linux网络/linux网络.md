@@ -1985,4 +1985,372 @@ static int process_backlog(struct napi_struct *napi, int quota)
 - 访问本机服务时，使用127.0.0.1和192.168.x.x更快吗
 5.3节可知，所有的本机IP会被初始化在本地的路由项中，最终都会走lo虚拟网卡，所以其实是没有差别的。都是走的虚拟网卡，走的数据路径都是一样的。
 # 第6章 深度理解TCP连接的建立过程
+## 相关实际问题
+- 为什么服务端程序需要先listen一下？
+listen内部做了什么？
+- 半连接队列和全连接队列的长度确定？  
+这两个数据结构在内核中是什么样的？
+- "can not assign requested address"报错出错的原因？
+错误产生以及解决方法？
+- 一个客户端端口可以同时放在两条连接上吗?
+已经有客户端和一个端口建立established的服务，下次连接其他服务端，这个端口还能使用吗？
+- 服务端的半/全连接队列满了会怎么样？
+如何确定队列溢出了？
+- 新连接的socket内核对象建立时间？
+是在accept的时候建立吗？
+- 建立一条tcp连接所需时间？
+接口耗时是一个衡量服务接口的重要指标。
+- 把服务器部署在北京，给纽约的用户访问？
+- 服务器负载正常，但是cpu被拉满了？
+即负载在正常范围内，但是cpu却拉的很高。接近100%。
+## 深入理解listen
+### listen系统调用
+```c
+//file: net/socket.c
+SYSCALL_DEFINE2(listen, int, fd, int, backlog)
+{
+ //根据 fd 查找 socket 内核对象
+ sock = sockfd_lookup_light(fd, &err, &fput_needed);//从fd态转为内核对象socket
+ if (sock) {
+  //获取内核参数 net.core.somaxconn
+  somaxconn = sock_net(sock->sk)->core.sysctl_somaxconn;
+  if ((unsigned int)backlog > somaxconn)//比较用户传入的backlog（和全连接和半连接队列有关系）和net.core.somaxconn，谁小谁往下传。
+   backlog = somaxconn;
+  
+  //调用协议栈注册的 listen 函数
+  err = sock->ops->listen(sock, backlog);//指向inet_lsiten函数
+  ......
+}
+}
+```
+### 协议栈listen
+```c
+//file: net/ipv4/af_inet.c
+int inet_listen(struct socket *sock, int backlog)
+{
+ //还不是 listen 状态（尚未 listen 过）
+ if (old_state != TCP_LISTEN) {
+  //开始监听
+  err = inet_csk_listen_start(sk, backlog);
+ }
+
+ //设置全连接队列长度
+ sk->sk_max_ack_backlog = backlog;
+}
+
+//file: net/ipv4/inet_connection_sock.c
+int inet_csk_listen_start(struct sock *sk, const int nr_table_entries)//当该套接字还没有监听时，需要这个函数来进行接收队列的申请和初始化。
+{
+ struct inet_connection_sock *icsk = inet_csk(sk);
+
+ //icsk->icsk_accept_queue 是接收队列，详情见 2.3 节 
+ //接收队列内核对象的申请和初始化，详情见 2.4节 
+ int rc = reqsk_queue_alloc(&icsk->icsk_accept_queue, nr_table_entries);
+ //这里重要的是接收队列的数据结构的定义，接收队列的申请以及初始化。
+ ......
+}
+```
+ sk->sk_max_ack_backlog = backlog;这里可以设置这个socket的全连接队列的长度。==即服务端的全连接长度和执行listen函数时传入的backlog和net.core.somaxconn之间的较小的那个值；全连接队列溢出，考虑增加队列长度时，可以同时考虑这两个参数==
+![image-20231214100906382](linux网络.assets/image-20231214100906382.png)
+如上图，在inet_csk_listen_start函数中，为什么能将sock转换为inet_connection,如上所示，其实各个数据结构的socket之间存在包含关系，最开始传入的socket是tcp_sock。类似c++的父子类的转换，这里是可以强制转换的。
+### 接收队列的定义
+icsk->icsk_accept_queue定义在inet_connection_sock下，是内核用来接收客户端请求的主要数据结构，全连接队列，半连接队列在这个数据结构下实现。
+![image-20231214102123281](linux网络.assets/image-20231214102123281.png)
+```c
+//file: include/net/inet_connection_sock.h
+struct inet_connection_sock {//这是tcp_sock转换为inet_connection_sock的数据结构后
+ /* inet_sock has to be the first member! */
+ struct inet_sock   icsk_inet;
+ struct request_sock_queue icsk_accept_queue;//接收队列
+ ......
+}
+//file: include/net/request_sock.h
+struct request_sock_queue {
+ //全连接队列，全连接队列采用先入先出的形式进行管理，所以通过头和尾以链表的形式管理
+ struct request_sock *rskq_accept_head;
+ struct request_sock *rskq_accept_tail;
+
+ //半连接队列
+ struct listen_sock *listen_opt;
+ ......
+};
+
+//file: 
+struct listen_sock {
+ u8   max_qlen_log;//和半连接队列的长度有关
+ u32   nr_table_entries;//和半连接队列的长度有关
+ ......
+ struct request_sock *syn_table[0];//哈希表进行管理，在第三次握手快速的查找出第一次握手留存的request_sock。
+};
+```
+### 接收队列的申请和初始化
+现在了解了inet_connection_sock里的icsk_accept_queue的结构组成，现在看怎样申请和初始化这个对象：
+```c
+//file: net/ipv4/inet_connection_sock.c
+int inet_csk_listen_start(struct sock *sk, const int nr_table_entries)
+{
+ ...
+ int rc = reqsk_queue_alloc(&icsk->icsk_accept_queue, nr_table_entries);
+ ...
+}
+
+//主要涉及request_sock_queue内核对象的创建和初始化。包括内存申请，半连接队列的长度计算，全连接队列头的初始化等
+//file: net/core/request_sock.c
+int reqsk_queue_alloc(struct request_sock_queue *queue,
+        unsigned int nr_table_entries)
+{
+ size_t lopt_size = sizeof(struct listen_sock);
+ struct listen_sock *lopt;
+
+ //计算半连接队列的长度
+ nr_table_entries = min_t(u32, nr_table_entries, sysctl_max_syn_backlog);//需要和系统设置的backlog进行比较取较小的那一个
+ nr_table_entries = ......
+
+ //为 listen_sock 对象申请内存，这里包含了半连接队列
+ lopt_size += nr_table_entries * sizeof(struct request_sock *);//这里计算的是哈希表，而真正的半连接的request_sock对象是在握手过程中分配的
+ if (lopt_size > PAGE_SIZE)
+  lopt = vzalloc(lopt_size);//连续物理空间分配
+ else
+  lopt = kzalloc(lopt_size, GFP_KERNEL);//在页内分配，不保证物理连续
+
+ //全连接队列头初始化
+ queue->rskq_accept_head = NULL;
+
+ //半连接队列设置
+ lopt->nr_table_entries = nr_table_entries;
+ queue->listen_opt = lopt;
+ ......
+}
+//大致流程是计算出半连接队列的长度，根据实际大小进行实际的内存分配，再进行全连接队列头的初始化化为NULL，最后将初始化的半连接队列挂到request_sock_queue的listen_opt上。
+```
+### 半连接队列的长度计算
+```c
+
+//file: net/core/request_sock.c
+int reqsk_queue_alloc(struct request_sock_queue *queue,
+        unsigned int nr_table_entries)//nr_table_entries为net.core.somaxconn和backlog之间的最小值
+{
+ //计算半连接队列的长度
+ nr_table_entries = min_t(u32, nr_table_entries, sysctl_max_syn_backlog);//这里sysctl_max_syn_backlog为内核参数，用于限制半连接队列的最大的数量
+ nr_table_entries = max_t(u32, nr_table_entries, 8);//不能比8小
+ nr_table_entries = roundup_pow_of_two(nr_table_entries + 1);//用来进行对齐，将数量对齐的2的整数次幂
+
+ //为了效率，不记录 nr_table_entries
+ //而是记录 2 的几次幂等于 nr_table_entries
+ for (lopt->max_qlen_log = 3;//意思只记录2的幂数来表示半连接队列的长度，为了性能
+      (1 << lopt->max_qlen_log) < nr_table_entries;
+      lopt->max_qlen_log++);
+ ......
+}
+```
+![image-20231214112854413](linux网络.assets/image-20231214112854413.png)
+如上图，可见半连接队列的长度主要是由tcp_max_syn_backlog，net.core.somaxconn,backlog三者来共同确定最终的半连接队列的大小。==半连接队列的长度=min(backlog,somaxconn,tcp_max_syn_backlog)+1的向上取整的2的整数次幂==。半连接队列溢出需要同时考虑这三个参数。
+### listen过程小结
+listen的主要工作是进行接收队列的申请和初始化，包括全连接队列和半连接队列。
+着重了解了全连接队列长度，半连接队列长度计算，
+## 深入了解connect
+![img](linux网络.assets/33EE0365A30E77174C96EF6885F593CB.jpg)
+### connect调用链展开
+首先调用connect的系统调用，找到fd对应的socket的内核对象，然后调用socket的ops的inet_stream_connect函数
+```c
+/*
+ *	Connect to a remote host. There is regrettably still a little
+ *	TCP 'magic' in here.
+ */
+int inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
+			int addr_len, int flags)
+{
+	struct sock *sk = sock->sk;//将socket内核对象的sock对象赋值给局部值
+	int err;
+	long timeo;
+
+	if (addr_len < sizeof(uaddr->sa_family))
+		return -EINVAL;
+
+	lock_sock(sk);//上锁，对sock的状态操作，读写，需要加锁，用完再释放
+
+	if (uaddr->sa_family == AF_UNSPEC) {
+		err = sk->sk_prot->disconnect(sk, flags);
+		sock->state = err ? SS_DISCONNECTING : SS_UNCONNECTED;
+		goto out;
+	}
+
+	switch (sock->state) {
+	default:
+		err = -EINVAL;
+		goto out;
+	case SS_CONNECTED:
+		err = -EISCONN;
+		goto out;
+	case SS_CONNECTING:
+		err = -EALREADY;
+		/* Fall out of switch with err, set for this state */
+		break;
+	case SS_UNCONNECTED://新创建的socket的状态就是SS_UNCONNECTED，
+		err = -EISCONN;
+		if (sk->sk_state != TCP_CLOSE)//tcp连接只有关闭才往下走
+			goto out;
+
+		err = sk->sk_prot->connect(sk, uaddr, addr_len);//这里主要是调用sock的sk_prot对应的tcp_v4_coonect函数
+		if (err < 0)
+			goto out;
+
+		sock->state = SS_CONNECTING;//设置状态为正在连接
+
+		/* Just entered SS_CONNECTING state; the only
+		 * difference is that return value in non-blocking
+		 * case is EINPROGRESS, rather than EALREADY.
+		 */
+		err = -EINPROGRESS;
+		break;
+	}
+	......
+}
+
+//tcp_connect主要做的事。
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+{
+ //设置 socket 状态为 TCP_SYN_SENT
+ tcp_set_state(sk, TCP_SYN_SENT);
+
+ //动态选择一个可用的端口，动态帅选出可用的端口
+ err = inet_hash_connect(&tcp_death_row, sk);
+
+ //函数用来根据 sk 中的信息，构建一个完成的 syn 报文，并将它发送出去。
+ err = tcp_connect(sk);
+}
+```
+### 选择可用的端口
+```c
+//inet_sk_offset根据要连接的目的ip和端口等信息生成一个随机数
+//__inet_check_established检查是否和现有的established状态连接冲突的时候用的函数
+//file:net/ipv4/inet_hashtables.c
+int inet_hash_connect(struct inet_timewait_death_row *death_row,
+        struct sock *sk)
+{
+ return __inet_hash_connect(death_row, sk, inet_sk_port_offset(sk),
+   __inet_check_established, __inet_hash_nolisten);
+}
+
+
+//file:net/ipv4/inet_hashtables.c
+int __inet_hash_connect(...)
+{
+ //是否绑定过端口，判断是否使用过bind函数，调用过，就会选好端口设置再snum；没有的话snum就为0.
+ const unsigned short snum = inet_sk(sk)->inet_num;
+
+ //获取本地端口配置
+ inet_get_local_port_range(&low, &high);
+  remaining = (high - low) + 1;//读取net.ipv4.ip_local_port_range这个内核参数，获取管理员配置的可用的端口范围。默认是32768，61000
+
+ if (!snum) {
+  //遍历查找
+  for (i = 1; i <= remaining; i++) {//offset为前面提到的生成的随机数，从某个随机数开始，遍历整个可用的端口，直到有可用端口为止。
+   port = low + (i + offset) % remaining;
+   ...
+  }
+ }
+}
+
+//file:net/ipv4/inet_hashtables.c
+int __inet_hash_connect(...)
+{
+ for (i = 1; i <= remaining; i++) {
+  port = low + (i + offset) % remaining;
+
+  //查看是否是保留端口，是则跳过，即看port是否在net.ipv4.ip_local_reserved_ports中
+  if (inet_is_reserved_local_port(port))
+   continue;
+
+  // 查找和遍历已经使用的端口的哈希链表
+  head = &hinfo->bhash[inet_bhashfn(net, port,
+    hinfo->bhash_size)];
+  inet_bind_bucket_for_each(tb, &head->chain) {
+
+   //如果端口已经被使用，有其他连接使用
+   if (net_eq(ib_net(tb), net) &&
+       tb->port == port) {
+
+                //通过 check_established 继续检查是否可用，如果返回值为0，该端口可以继续使用
+    if (!check_established(death_row, sk,
+       port, &tw))
+     goto ok;
+   }
+  }
+	tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep,
+					net, head, port);//找到一个不是保留端口且也不在使用过的端口的哈希链表hinfo->bhash中的端口，这个函数就会申请一个inet_bind_bucket来记录端口已经使用，并且也是加入到哈希表中了。
+	.......
+  //未使用的话，直接 ok
+  goto ok;
+ }
+
+ return -EADDRNOTAVAIL;//这个错误就对应着“cannot assign requested address”,出现这个错误表名没有可用端口。这就需要取查看ip_local_port_range是不是设置的范围太小了
+ok: 
+ ...  
+}
+```
+### 端口被使用过怎么办
+在上述所述中，net_eq判断有端口使用后，在check_established后，如果返回值为0，还可以继续使用。为什么一个端口可复用？
+- 连接1：192.168.1.101 5000 192.168.1.100 8090
+- 连接2：192.168.1.101 5000 192.168.1.100 8091
+==如上两个四元组，check_established检查现有tcp连接中是否四元组和现有的四元组完全一致，如果不一致，则可以使用。==
+```c
+//如下是check_established的调用的函数
+//file: net/ipv4/inet_hashtables.c
+static int __inet_check_established(struct inet_timewait_death_row *death_row,
+        struct sock *sk, __u16 lport,
+        struct inet_timewait_sock **twp)
+{
+ //找到hash桶
+ struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);//
+
+ //遍历看看有没有四元组一样的，一样的话就报错
+ sk_nulls_for_each(sk2, node, &head->chain) {
+  if (sk2->sk_hash != hash)
+   continue;
+  if (likely(INET_MATCH(sk2, net, acookie,
+          saddr, daddr, ports, dif)))
+   goto not_unique;
+ }
+
+unique:
+ //要用了，记录，返回 0 （成功）
+ return 0;
+not_unique:
+ return -EADDRNOTAVAIL; 
+}
+```
+遍历由established的socket组成的哈希表，遍历哈希表，使用INET_MATCH查看是否可用（对_saddr,_daddr,_ports）进行比较，tcp连接不只有ip，端口可能有其他项构成五元组，七元组等这里统称为四元组。一有完全匹配的四元组，则返回-EADDRNOTAVAIL，对应前面的“cannot assign requested address”错误。==这里有个潜在的知识是，一个客户机不是只能最大连接65535条连接，只要服务端够多，一个端口对应多个服务端口，可建立百万连接==
+### 发起syn请求
+获得可用端口后，正式开始发送syn请求，在tcp_v4_connect的tcp_connect中
+```c
+
+//file:net/ipv4/tcp_output.c
+int tcp_connect(struct sock *sk)
+{
+ //申请并设置 skb
+ buff = alloc_skb_fclone(MAX_TCP_HEADER + 15, sk->sk_allocation);
+ tcp_init_nondata_skb(buff, tp->write_seq++, TCPHDR_SYN);
+
+ //添加到发送队列 sk_write_queue 上
+ tcp_connect_queue_skb(sk, buff);
+
+ //实际发出 syn
+ err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
+       tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+
+ //启动重传定时器
+ inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+      inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+}
+```
+经过上面的skb申请以及设置skb，再添加skb到socket的sk_write_queue发送队列上，熟悉·的tcp_transmit_skb将该包发给ip层处理函数。最后启动超时重传器，超时重发（这个定时器的初始值不同内核版本不一样，1s,3s都是有可能的）。
+### connect小结
+==即客户端执行connect函数，本地socket设置为TCP_SYN_SENT，选用可用端口，再发出SYN握手请求，并启用超时重传==
+**这里需要注意的是，如果ip_local_port_range中的很多端口都用了，那么很可能在执行connect调用时，需要循环执行多轮才能找到可用的端口，这将会导致connect系统调用的开销增加**
+如在connect之前，该socket使用了bind，则connect会使用bind的绑定的端口（==传入了端口则首先使用该端口，没有传入或传入0，还是会自动选择一个==，对于客户端的socket还是不建议使用bind进行绑定）。
+## 完整tcp连接建立过程
+
+
 
