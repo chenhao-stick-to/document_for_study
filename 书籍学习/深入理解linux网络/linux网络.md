@@ -1793,7 +1793,7 @@ static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
 原因很多，其中之一就是使用了sendfile的系统调用来发送数据包。（节省了两次数据拷贝）
 
 # 第五章 深度理解本机网络IO
-# 相关实际问题
+## 相关实际问题
 - 127.0.0.1本机网络IO需要过网卡码？
 跨机网络需要网卡，但本机127.0.0.1通信需要经过网卡码？
 - 数据包在内核走向和外网发送相比流程上有什么差别？
@@ -2355,5 +2355,468 @@ int tcp_connect(struct sock *sk)
 ### 服务端响应SYN
 服务端，所有TCP包括客户端的SYN的握手请求经过网卡，软中断，再到tcp_v4_rcv。根据（skb）中的tcp头的信息的目的ip查到处于listen状态的socket（即socket的sock的下面的inet_connection_sock的等待队列（包含全连接和半连接队列）），继续进入tcp_v4_so_rcv（）处理
 ```c
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+{
+ ...
+ //服务器收到第一步握手 SYN 或者第三步 ACK 都会走到这里
+ if (sk->sk_state == TCP_LISTEN) {
+  struct sock *nsk = tcp_v4_hnd_req(sk, skb);
+ }
 
+ if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb->len)) {
+  rsk = sk;
+  goto reset;
+ }
+}
+
+//首先查看当前的sokcet处于listen状态，执行tcp_v4_hnd_req查看半连接队列，第一次响应SYN，半连接队列为空，直接返回
+//file:net/ipv4/tcp_ipv4.c
+static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+{
+ // 查找 listen socket 的半连接队列
+ struct request_sock *req = inet_csk_search_req(sk, &prev, th->source,
+          iph->saddr, iph->daddr);
+ ...
+ return sk;
+}
+
+//file:net/ipv4/tcp_input.c
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+     const struct tcphdr *th, unsigned int len)
+{
+ switch (sk->sk_state) {
+  //第一次握手
+  case TCP_LISTEN:
+   if (th->syn) { //判断是 SYN 握手包
+    ...
+    if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)//conn_request是函数指针，指向tcp_v4_conn_request
+     return 1;
+ ......
+}  
+}
+}
+
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+ //看看半连接队列是否满了
+ if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
+  want_cookie = tcp_syn_flood_action(sk, skb, "TCP");//半连接队列是否开启tcp_cookies参数，队列满且未开启tcp_syncookies，则直接丢弃syn包
+  if (!want_cookie)
+   goto drop;
+ }
+
+ //在全连接队列满的情况下，如果有 young_ack（半连接队列保持的计数器，记录的是有SYN到达，没有被SYN_ACK重传定时器重传过的SYN_ACK,且未完成三次握手的sk数量），那么直接丢
+ if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
+  NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+  goto drop;
+ }
+ ...
+ //分配 request_sock 内核对象
+ req = inet_reqsk_alloc(&tcp_request_sock_ops);//这里创建的request_sock对象便于加入半连接的哈希表中
+
+ //构造 syn+ack 包，即SYN_ACK包
+ skb_synack = tcp_make_synack(sk, dst, req,
+  fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);
+
+ if (likely(!do_fastopen)) {
+  //发送 syn + ack 响应，将SYN_ACK报视作skb包正常发送出去
+  err = ip_build_and_send_pkt(skb_synack, sk, ireq->loc_addr,
+    ireq->rmt_addr, ireq->opt);
+
+  //添加到半连接队列，并开启计时器，添加到对应的sk的半连接哈希表，并且设置了超时重传的机制
+  inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
+ }else ...
+}
 ```
+小结就是，服务端响应客户端的syn包，像正常的网络包一样，解析syn包装成的skb包，分析目标IP地址找到对应的socket的半连接队列，查看半连接队列或者全连接队列（young_ack判断）是否满了，满则丢弃，否则申请request_sock，发送syn_ack包。request_sock添加到对应的socket的半连接队列，并且设置超时重传机制。
+### 客户端响应SYN_ACK
+客户端收到服务端发来的synack包，进入tcp_rcv_state_process函数。
+```c
+//file:net/ipv4/tcp_input.c
+//除了 ESTABLISHED 和 TIME_WAIT，其他状态下的 TCP 处理都走这里
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+     const struct tcphdr *th, unsigned int len)
+{
+ switch (sk->sk_state) {//
+  //服务器收到第一个ACK包
+  case TCP_LISTEN:
+   ...
+  //客户端第二次握手处理 
+  case TCP_SYN_SENT://和服务端不一样，此时客户端的socket的状态应该处于TCP_SYN_SENT状态
+   //处理 synack 包
+   queued = tcp_rcv_synsent_state_process(sk, skb, th, len);
+   ...
+   return 0;
+}
+}
+
+//这里是对syn_ack包的处理
+//file:net/ipv4/tcp_input.c
+static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+      const struct tcphdr *th, unsigned int len)
+{
+ ...
+
+ tcp_ack(sk, skb, FLAG_SLOWPATH);
+
+ //连接建立完成 
+ tcp_finish_connect(sk, skb);
+
+ if (sk->sk_write_pending ||
+   icsk->icsk_accept_queue.rskq_defer_accept ||
+   icsk->icsk_ack.pingpong)
+  //延迟确认...
+ else {
+  tcp_send_ack(sk);
+ }
+}
+
+//这里是tcp_ack调用的tcp_clean_rtx_queue函数
+//file: net/ipv4/tcp_input.c
+static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
+       u32 prior_snd_una)
+{
+ //删除发送队列，即前面的tcn_v4_connect发送包含SYN包的skb的关联的socket的发送队列
+ ...
+
+ //删除定时器。即前面的超时重传的syn包的重传定时器
+ tcp_rearm_rto(sk);
+}
+
+//这里是用于
+//file: net/ipv4/tcp_input.c
+void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
+{
+ //修改 socket 状态
+ tcp_set_state(sk, TCP_ESTABLISHED);//将socket的状态从TCP_LISTEN转换未TCP_ESTABLISHED
+
+ //初始化拥塞控制,这里设置传输层的拥塞控制的初始化函数
+ tcp_init_congestion_control(sk);
+ ...
+
+ //保活计时器打开，这个保活计时器的作用是保证tcp套接字在长时间没有活动的情况下防止被关闭
+ if (sock_flag(sk, SOCK_KEEPOPEN))
+  inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tp));
+}
+
+
+//file:net/ipv4/tcp_output.c
+void tcp_send_ack(struct sock *sk)
+{
+ //申请和构造 ack 包
+ buff = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));
+ ...
+
+ //发送出去，故技重施，将ack包包装成skb包进行发送
+ tcp_transmit_skb(sk, buff, 0, sk_gfp_atomic(sk, GFP_ATOMIC));
+}
+```
+小结就是客户端响应synack，首先清除掉发送队列和超时重传器，然后重新设置socket状态，拥塞控制算法，以及打开保活计时器，最后再申请构造ack包，然后再发送出去。
+### 服务端响应ACK
+```c
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+{
+ ...
+ if (sk->sk_state == TCP_LISTEN) {
+  struct sock *nsk = tcp_v4_hnd_req(sk, skb);//由于第三次握手，这里的半连接队列里面以及有了第一次握手的信息，所以会执行，而不是什么都不做返回。
+ }
+
+ if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb->len)) {
+  rsk = sk;
+  goto reset;
+ }
+}
+
+//file:net/ipv4/tcp_ipv4.c
+static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+{
+ ...
+ struct request_sock *req = inet_csk_search_req(sk, &prev, th->source,
+          iph->saddr, iph->daddr);//查找半连接的哈希表找到对应的request_sock后返回，然后执行tcp_check_req.
+ if (req)
+  return tcp_check_req(sk, skb, req, prev, false);
+ ...
+}
+
+//file：net/ipv4/tcp_minisocks.c
+struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+      struct request_sock *req,
+      struct request_sock **prev,
+      bool fastopen)
+{
+ ...
+ //创建子 socket
+ child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL);//函数指针，指向的是tcp_v4_syn_recv_sock函数
+ ...
+
+ //清理半连接队列
+ inet_csk_reqsk_queue_unlink(sk, req, prev);
+ inet_csk_reqsk_queue_removed(sk, req);
+
+ //添加全连接队列
+ inet_csk_reqsk_queue_add(sk, req, child);
+ return child;
+}
+
+//file:net/ipv4/tcp_ipv4.c
+const struct inet_connection_sock_af_ops ipv4_specific = {
+ ......
+ .conn_request      = tcp_v4_conn_request,
+ .syn_recv_sock     = tcp_v4_syn_recv_sock,//这里对应上面的函数指针，这是结构体内进行初始化
+}
+//三次握手接近就算是完毕了，这里创建 sock 内核对象
+struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+      struct request_sock *req,
+      struct dst_entry *dst)
+{    
+ //判断接收队列是不是满了
+ if (sk_acceptq_is_full(sk))//继续判断全连接队列是否满了，满了就修改计数器然后丢弃
+  goto exit_overflow;
+
+ //创建 sock && 初始化
+ newsk = tcp_create_openreq_child(sk, req, skb);//！注意这里的重点？为什么需要创建新的sock对象，原因是基于四元组的存在，一个socket是可以同时连接多个客户端的请求的，这就意味着我们需要为每个请求创建一个新的sock对象来对应，这样每个请求对应的sock是独立的，都有自己独立的sock状态以及缓冲区，如接收队列等
+}
+
+//这里是进行半连接队列的清理，即清理掉对应的request_sock
+//file: include/net/inet_connection_sock.h 
+static inline void inet_csk_reqsk_queue_unlink(struct sock *sk, struct request_sock *req,
+ struct request_sock **prev)
+{
+ reqsk_queue_unlink(&inet_csk(sk)->icsk_accept_queue, req, prev);
+}
+
+//将握手成功的srequest_sock对象加入到全连接队列的链表尾部
+//file:net/ipv4/syncookies.c
+static inline void inet_csk_reqsk_queue_add(struct sock *sk,
+      struct request_sock *req,
+      struct sock *child)
+{
+ reqsk_queue_add(&inet_csk(sk)->icsk_accept_queue, req, sk, child);
+}
+
+//file: include/net/request_sock.h
+static inline void reqsk_queue_add(...)
+{
+ req->sk = child;//将全连接队列的对应的request_sock的sock对象设置为前面先创建的子sock内核对象
+ sk_acceptq_added(parent);
+
+ if (queue->rskq_accept_head == NULL)
+  queue->rskq_accept_head = req;
+ else
+  queue->rskq_accept_tail->dl_next = req;
+
+ queue->rskq_accept_tail = req;//将新的req对象添加到全连接队列的链表尾部
+ req->dl_next = NULL;
+}
+
+//第三次握手时，tcp_rcv_state_process的路径不太一样。是走子sock对象进来的（即前面的tcp_v4_hnd_req为新的连接创立的新的子sock对象）
+//file:net/ipv4/tcp_input.c
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+     const struct tcphdr *th, unsigned int len)
+{
+ ...
+ switch (sk->sk_state) {
+
+  //服务端第三次握手处理
+  case TCP_SYN_RECV://子sock对象的状态时TCP_SYN_RECV
+
+   //改变状态为连接
+   tcp_set_state(sk, TCP_ESTABLISHED);//将这个状态修改为TCP_ESTABLISHED
+   ...
+ }
+}
+```
+小结就是，将半连接队列的对象删除，创建新的子sock对象，设置req的sock为新的子sock对象，最后将其加入到全连接队列链表尾，设置sock的状态为TCP_LISTEN状态。
+### 服务端accept
+```c
+//file: net/ipv4/inet_connection_sock.c
+struct sock *inet_csk_accept(struct sock *sk, int flags, int *err)
+{
+ //从全连接队列中获取
+ struct request_sock_queue *queue = &icsk->icsk_accept_queue;//获取当前socket的等待队列
+ req = reqsk_queue_remove(queue);//获取等待队列的全连接队列的链表头元素
+
+ newsk = req->sk;
+ return newsk;//返回这个request_sock的sock对象
+}
+
+//file:include/net/request_sock.h
+static inline struct request_sock *reqsk_queue_remove(struct request_sock_queue *queue)
+{
+ struct request_sock *req = queue->rskq_accept_head;
+
+ queue->rskq_accept_head = req->dl_next;
+ if (queue->rskq_accept_head == NULL)
+  queue->rskq_accept_tail = NULL;
+
+ return req;
+}
+```
+小结就是从socket的全连接队列取一个request_sock对象的sock返回给用户进程。
+### 连接建立过程总结
+![image-20231215162710496](linux网络.assets/image-20231215162710496.png)
+- 1. 服务器 listen 时，计算了全/半连接队列的长度，还申请了相关内存并初始化。
+- 2. 客户端 connect 时，把本地 socket 状态设置成了 TCP_SYN_SENT，选则一个可用的端口，发出 SYN 握手请求并启动重传定时器。
+- 3. 服务器响应 ack 时，会判断下接收队列是否满了，满的话可能会丢弃该请求。否则发出 synack，申请 request_sock 添加到半连接队列中，同时启动定时器。
+- 4. 客户端响应 synack 时，清除了 connect 时设置的重传定时器，把当前 socket 状态设置为 ESTABLISHED，开启保活计时器后发出第三次握手的 ack 确认。
+- 5. 服务器响应 ack 时，把对应半连接对象删除，创建了新的 sock 后加入到全连接队列中，最后将新连接状态设置为 ESTABLISHED。
+- 6. accept 从已经建立好的全连接队列中取出一个返回给用户进程
+==握手过程中有很多定时器，发生丢包，再到达定时器时间时，会重新上传，重试次数由tcp_syn_retries和tcp_synack_retries来控制==
+一条TCP连接需要消耗多长时间？
+- 一类是内核消耗CPU进行接收，发送，协议栈处理等，包括系统调用，软中断，上下文切换等，耗时在几微秒。
+- 网路传输，经过网线，路由器，交换机，相比本机传输高得多，在几毫秒到几百毫秒。
+一般网络处理考虑网络延时即可：
+一个RTT即衡量一台服务器到另一台服务器的来回的延迟时间，TCP需要三次传输，加上CPU开销，大于1.5RTT一点。客户端在SYN_ACK确认后就可以发送数据，所以在客户端看来只有1个RTT多一点。对于服务端，以它的视角看，从接收SYN起，其实也是1个RTT多一点。**以上都是正常TCP连接耗时，下面讨论异常情况**
+## 异常TCP连接建立情况
+后端接口性能指标中一类重要指标就是接口耗时。
+### connect系统调用耗时失控
+前面简单介绍过，connect系统调用的主要工作时端口选择。
+一个线上问题是cpu负载正常，但使用率却是几乎到100%。事发原因是可用端口不是特别充足。这就回到了inet_has_connect函数的ip_local_port_range的随机位置开始循环一遍查找可用的端口。
+```c
+//在循环内部，等待锁和在哈希表中的搜寻操作，自旋锁不会释放cpu，当可用端口几乎用尽时，每次循环可用端口数量这么多次，会消耗大量的cpu'资源
+//file:net/ipv4/inet_hashtables.c
+int __inet_hash_connect(...)
+{
+ inet_get_local_port_range(&low, &high);
+ remaining = (high - low) + 1;
+
+ for (i = 1; i <= remaining; i++) {
+  // 其中 offset 是一个随机数
+  port = low + (i + offset) % remaining;
+  head = &hinfo->bhash[inet_bhashfn(net, port,
+     hinfo->bhash_size)];
+
+  //加锁
+  spin_lock(&head->lock); 
+
+  //一大段的选择端口逻辑
+  //......
+  //选择成功就 goto ok
+  //不成功就 goto next_port
+
+  next_port:
+   //解锁
+   spin_unlock(&head->lock); 
+ }
+}
+```
+![image-20231215171102905](linux网络.assets/image-20231215171102905.png)
+在同一端口，当端口充足和不充足的两种情况下，时间消耗有百倍差距。这种情况的解决办法无非就是，增加可用端口数或者尽快的释放掉不用的连接端口（TIME_WAIT），长连接等
+### 第一次握手丢包
+#### 半连接队列满
+即服务端收ayn包时，先判断半连接队列是否满，满而且tcp_syncookies设置为0，就会直接丢弃syn包。
+==syn_flood攻击就是耗光服务器端的半连接队列，这样正常用户的syn请求会被丢弃，使得其建立不了连接。==
+#### 全连接队列满
+接下来判断全连接队列是否满，如果全连接队列满，且同时已经有young_ack(还未重传syn_ack,但是已经发送了syn_ack,没有第三次握手)。那么会丢弃该syn握手包。
+#### 客户端发起重试
+服务端对syn包丢弃没有响应，客户端收不到syn_ack，由于开启了syn重传定时器，这样等到定时后，重新发送syn包（耗时，一般1s甚至几秒后）
+```c
+//启用了超时重传
+//file:net/ipv4/tcp_output.c
+int tcp_connect(struct sock *sk)
+{
+ ...
+ //实际发出 syn
+ err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
+       tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+
+ //启动重传定时器
+ inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+      inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+}
+
+//对应的超时重传处理函数
+//file:ipv4/tcp_output.c
+void tcp_connect_init(struct sock *sk)
+{
+ //初始化为 TCP_TIMEOUT_INIT 
+ inet_csk(sk)->icsk_rto = TCP_TIMEOUT_INIT;
+ ...
+}
+
+//file: include/net/tcp.h
+#define TCP_TIMEOUT_INIT ((unsigned)(1*HZ)) //设置为1s
+
+
+//这里时收到synack包后，需要清理synack包
+//file:net/ipv4/tcp_input.c
+void tcp_rearm_rto(struct sock *sk)
+{
+ inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);//进行定时器的清除
+}
+```
+如果是超时（==其实连接状态的tcp超时重传也是在这里完成的==）的情况，则会进入回调函数，调用tcp_write_timer重传。
+```c
+//file: net/ipv4/tcp_timer.c
+static void tcp_write_timer(unsigned long data)
+{
+ tcp_write_timer_handler(sk);
+ ...
+}
+
+void tcp_write_timer_handler(struct sock *sk)
+{
+ //取出定时器类型。
+ event = icsk->icsk_pending;
+
+ switch (event) {
+ case ICSK_TIME_RETRANS://根据不同的定时器类型，这里是握手重传，也有可能连接状态的重传
+  icsk->icsk_pending = 0;
+  tcp_retransmit_timer(sk);//这里完成重传
+  break;
+ ......
+ }
+}
+
+//file: net/ipv4/tcp_timer.c
+void tcp_retransmit_timer(struct sock *sk)
+{
+ ...
+
+ //超过了重传次数则退出
+ if (tcp_write_timeout(sk))//超过设置次数，这里的实现逻辑比较复杂，对syn握手包的重传次数是通过net.ipv4.tcp_syn_retires,但也不是比较次数，而是转换成时间进行对比。**故内核参数和实际重传参数不一致不用惊讶**。
+  goto out;
+
+ //重传
+ if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) > 0) {//重新发出skb包，发送该sock的发送队列的头元素skb
+  //重传失败
+  ......
+ }
+
+//退出前重新设置下一次超时时间
+out_reset_timer:
+ //计算超时时间
+ if (sk->sk_state == TCP_ESTABLISHED ){//已经是连接状态
+  ......
+ } else {//处于非连接状态
+  icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);//左移一位，不超过设置最大值
+ }
+
+ //设置
+ inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk->icsk_rto, TCP_RTO_MAX); 
+}
+```
+重传多次，由于超时重传时间的增加，将极大影响用户的使用体验。
+==此外，可能影响其他用户，如使用进程池/线程池模式提供服务，如果是采用php-fpm模式，即如果是阻塞类的进程，在连接时如果过多进程阻塞在超时重传，那么进程/线程池可用进程/线程大量减少，导致服务产生拥堵，甚至可能挂掉==
+### 第三次握手丢包
+```c
+//第三次握手主要工作是判断socket的全连接队列是否满，创建新的sock对象，取下半连接队列对应的request_sock，更新这个request_sock的sock为新创建的sock，然后连接到全连接队列队尾，最后设置sock状态为established
+//file: net/ipv4/tcp_ipv4.c
+struct sock *tcp_v4_syn_recv_sock(struct sock *sk, ...)
+{    
+    //判断接收队列是不是满了
+    if (sk_acceptq_is_full(sk))
+        goto exit_overflow;
+    ...
+exit_overflow:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+ ...
+}
+```
+这里判断socket的全连接队列是否队满，队满则会直接丢弃这个ack握手包，但是不同的是这里是服务端进行重发synack包给客户端，客户端再次响应后，服务端这里又继续以前的操作。服务端重试net.ipv4.tcp_synack_retries控制次数后就会放弃。这时客户端在第一次发出ack包后发的所有的数据都会被服务端所无视，除非连接建立成功。
+
+### 握手异常总结
+
