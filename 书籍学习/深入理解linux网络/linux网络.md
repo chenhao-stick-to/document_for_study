@@ -2707,7 +2707,7 @@ int __inet_hash_connect(...)
 在同一端口，当端口充足和不充足的两种情况下，时间消耗有百倍差距。这种情况的解决办法无非就是，增加可用端口数或者尽快的释放掉不用的连接端口（TIME_WAIT），长连接等
 ### 第一次握手丢包
 #### 半连接队列满
-即服务端收ayn包时，先判断半连接队列是否满，满而且tcp_syncookies设置为0，就会直接丢弃syn包。
+即服务端收syn包时，先判断半连接队列是否满，满而且tcp_syncookies设置为0，就会直接丢弃syn包。
 ==syn_flood攻击就是耗光服务器端的半连接队列，这样正常用户的syn请求会被丢弃，使得其建立不了连接。==
 #### 全连接队列满
 接下来判断全连接队列是否满，如果全连接队列满，且同时已经有young_ack(还未重传syn_ack,但是已经发送了syn_ack,没有第三次握手)。那么会丢弃该syn握手包。
@@ -2765,7 +2765,7 @@ void tcp_write_timer_handler(struct sock *sk)
  switch (event) {
  case ICSK_TIME_RETRANS://根据不同的定时器类型，这里是握手重传，也有可能连接状态的重传
   icsk->icsk_pending = 0;
-  tcp_retransmit_timer(sk);//这里完成重传
+  tcp_retransmit_timer(sk);//这里完成重传 
   break;
  ......
  }
@@ -2817,6 +2817,92 @@ exit_overflow:
 }
 ```
 这里判断socket的全连接队列是否队满，队满则会直接丢弃这个ack握手包，但是不同的是这里是服务端进行重发synack包给客户端，客户端再次响应后，服务端这里又继续以前的操作。服务端重试net.ipv4.tcp_synack_retries控制次数后就会放弃。这时客户端在第一次发出ack包后发的所有的数据都会被服务端所无视，除非连接建立成功。
-
 ### 握手异常总结
+- 端口不充足，调整ip_local_port_range加大端口范围；复用连接，使用长连接削减频繁的握手处理，开启tcp_rw_reuse(启用TIME_WAIT的快速回收机制),tcp_tw_recycle(使用时间戳，而不是2MSL（通常几分钟);
+- 第一次握手丢包，即半连接队列满且tcp_syncookies为0；全连接队列满，已有未完成的半连接请求。
+- 服务器第三次握手，全连接队列满，服务端发送synack重试。
+![image-20231220141503500](linux网络.assets/image-20231220141503500.png)
+上面是使用ss -nlt查看os的recv-Q以及send-Q，如果recv-Q逼近send-Q，不需要等到丢包就可扩大全连接队列。
+发生丢包解决方案：
+打开tcp_syncookies,加大连接队列长度,尽快调用accept（应用程序尽快在握手成功后取走全连接socket），尽早拒绝（即已经做了加大对列等处理还是溢出，服务端就应该直接报错返回给客户端，而不是一味的超时重传等待），尽量减少tcp连接的次数（如长连接代替短连接）.
+## 如何查看是否有连接队列溢出发生
+### 全连接队列溢出判断
+#### 全连接溢出丢包
+全连接队列溢出记录到ListenOverflows这个MIB，对应到SNMP的ListenDrops项。
+```c
+//这时第一次握手时，服务端查看全连接队列是否满，这里涉及 LINUX_MIB_LISTENOVERFLOWS， LINUX_MIB_LISTENDROPS两个MIB
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+ //看看半连接队列是否满了
+ ...
 
+ //看看全连接队列是否满了
+ if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
+  NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+  goto drop;
+ }
+ ...
+drop:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+ return 0;
+}
+
+//对于第三次握手的全连接队列溢出判断，也是这两个mib
+//file: net/ipv4/tcp_ipv4.c
+struct sock *tcp_v4_syn_recv_sock(...)
+{
+ if (sk_acceptq_is_full(sk))
+  goto exit_overflow;
+ ...
+exit_overflow:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS); 
+exit:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+ return NULL;
+} 
+//这两个MIB被整合进了SNMP
+```
+#### netstat工具源码
+执行netstat -s可以从SNMP中将以上两个MIB显示出来。
+通过watch "netstat -s | grep overflowed"可以查看的是全连接队列溢出次数，通过这个命令观察前后两次的次数是否一样即可判断全连接队列是否溢出。
+### 半连接队列溢出判断
+半连接队列溢出是修改的LINUX_MIB_LISTENDROPS，全连接和半连接队列溢出时都会增加这个MIB的值。所以 即使这个值发生改变，也不知道时哪个队列溢出了。
+所以最简单的办法是检查tcp_syncookies是否为1。为1即为真，半连接队列不可能发生溢出，即使不为1，也可修改为1，解决半连接队列的溢出问题。
+还有就是可以通过netstat -antp | grep SYN_RECV查看对应的listen的SYN_RECV数量，再和以前提到的计算半连接队列长度的计算值比较，达到了这个计算值则说明半连接队列差不多溢出了。
+## 本章总结
+- 为什么服务端程序需要先listen一下？
+listen做了创建，初始化半连接和全连接队列这些内核中重要数据结构。
+- 半连接队列和全连接队列长度如何确定？
+半连接队列，考虑min(backlog,somanxconn,tcp_max_syn_backlog)+1再向上取整到2的整数幂（大于等于16），故修改半连接队列长度需综合考虑三者。针对全连接队列长度，即min(somaxconn,backlog).
+- ”cannot assign requested address"报错是怎么回事？如何解决？
+在客户端循环寻找可用的随机端口（从ip_local_port_range中的一个位置开始循环判断，剔除保留端口，规避已用端口），循环完找不到可用端口则报错。
+- 一个客户端端口可以用在两条连接上吗？
+可以的，因为在connect判断端口是否可用时是通过四元组来判断的。只要服务器的ip,端口不同则端口可用，所以客户端可以构造百万连接。
+- 服务器半/全连接队列满了咋办？
+首先判断半/全连接队列是否溢出；再tcp_syncookies,或者增大半/全连接长度等。
+- 新连接的sock对象啥时候建立？
+第三次握手的时候，创建好保存到全连接队列的request_sock中，accept可以直接取出。
+- 建立一次TCP消耗对少时间？
+正常握手连接是1.5个RTT多一点（接收，发送，cpu等时间开销），单针对客户端/服务端来说是1个RTT多一点。握手异常，进行重传，那时间就久了。
+- 服务器部署在北京，给纽约用户访问？
+由于距离远，1个RTT太久了，会影响秒级服务，所以一般当地建机房等。
+- 服务器负载正常，cpu拉满了？
+即connect系统调用，端口不充足的问题。白白消耗cpu资源循环。
+# 第7章 一条tcp连接消耗多少内存
+## 相关实际问题
+- 内核如何管理内存？
+- 如何查看内核使用内存信息？
+- 服务器上一条ESTABLISHED状态的空连接需消耗多少内存？
+- 机器上出现3万个TIME_WAIT，内存开销会大吗？
+## Linux内核如何管理内存
+内核不想应用程序那样提供虚拟内存机制，内核对自己的场景，使用SLAB/SLUB的内存管理机制。
+![image-20231220155520397](linux网络.assets/image-20231220155520397.png)
+如图slab的内存管理，依次划分为node，zone(DMA,Normal等区域)，伙伴系统，页。
+### node划分
+dmidecode可查看主板上cpu详细信息。
+![image-20231220160824082](linux网络.assets/image-20231220160824082.png)
+如上是现代cpu和内存的架构，即NUMA架构。
+![image-20231220160721380](linux网络.assets/image-20231220160721380.png)
+以上numactl --hardware可查看计算机中的每个numa节点的包含cpu以及内存大小。
+### zone划分
