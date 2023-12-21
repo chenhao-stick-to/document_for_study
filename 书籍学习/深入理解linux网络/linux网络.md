@@ -2905,4 +2905,90 @@ dmidecode可查看主板上cpu详细信息。
 如上是现代cpu和内存的架构，即NUMA架构。
 ![image-20231220160721380](linux网络.assets/image-20231220160721380.png)
 以上numactl --hardware可查看计算机中的每个numa节点的包含cpu以及内存大小。
+
 ### zone划分
+![image-20231221171645743](linux网络.assets/image-20231221171645743.png)
+以上，对于一个node可划分为多个zone。
+- ZONE_DMA：地址段最低的一块内存区域，供IO设备访问。
+- ZONE_DMA32:zone支持32位地址总线的DMA设备，针对64位系统有效。
+- ZONE_NORMAL:对于x86系统，除了前两个其他都是ZONE_NORMAl.
+cat /proc/zoneinfo查看系统的zone划分：（通过每个zone的managed的页数乘以页大小（一般4KB）得到最终的zone区域大小）
+![image-20231221173132442](linux网络.assets/image-20231221173132442.png)
+以下是node，zone，page关系
+![image-20231221173203575](linux网络.assets/image-20231221173203575.png)
+### 基于伙伴系统管理空闲页面
+如下：
+```c
+//file: include/linux/mmzone.h
+#define MAX_ORDER 11
+struct zone {
+    free_area   free_area[MAX_ORDER];
+    ......
+}//zone里面的空闲区域是一个链表，大小位11，从4K到4MB有11种类型的空闲链表。
+```
+![image-20231221174824048](linux网络.assets/image-20231221174824048.png)
+上图位伙伴系统大致作用，每一个大小的空闲块（这个空闲块是由连续的页组成的）链表都分为unmoveable(不可移动类型，不能用于页面置换的)，moveable(可移动类型，可用于页面置换)，relclaimable（可回收类型，即系统可以回收利用的页，可以是可移动或不可移动的）
+![image-20231221174956124](linux网络.assets/image-20231221174956124.png)
+以上是通过cat /proc/pagetypeinfo得到的每个zone的伙伴系统的各个大小空闲块的可用数量。
+struct page * alloc_pages(gfp_t gfp_mask, unsigned int order)这个函数可申请伙伴系统的连续内存。
+![image-20231221190104772](linux网络.assets/image-20231221190104772.png)
+上图为分配页的过程。在释放页的时候，可能将两个小伙伴释放为更大块的连续内存。
+### slab分配器/==后面学习内存模块再详细了解==
+基于伙伴系统的页分配器，一个页一般为4KB太大了，而实际很多时候内核的申请对象只有1KB甚至几百字节。所以直接分配一个页太浪费了。所以在伙伴系统上又搞了一个slab/slub分配器。
+slab分配器特点。一个slab只分配特定大小，甚至已经有了特定的内核对象使用。
+```c
+//file: include/linux/slab_def.h
+struct kmem_cache {
+    struct kmem_cache_node **node//这个在一个numa的node结点中，我目前将其看作是一个node的”特殊的zone“，一个node可以有多个特殊的"zone"
+    ......
+}
+
+//file: mm/slab.h
+struct kmem_cache_node {//一个kmem_cache对应一个kmem_cache_node进行管理。包含满，半满，空三个链表。
+    struct list_head slabs_partial; 
+    struct list_head slabs_full;
+    struct list_head slabs_free;
+    ......
+}
+```
+![image-20231221193613425](linux网络.assets/image-20231221193613425.png)
+如上图，满/半满/空链表，即对应的那些将页划分为固定大小的slab的状态，如果slab全分配则这个slab链接到满链表，如果slab全空闲，则这个slab链接到空链表。半满则在中间。
+==当kmem_cache的内存不够时，则需要调用基于伙伴系统的分配器请求整页连续分配==
+```c
+//file: mm/slab.c
+static void *kmem_getpages(struct kmem_cache *cachep, 
+         gfp_t flags, int nodeid)
+{
+    ......
+    flags |= cachep->allocflags;
+    if (cachep->flags & SLAB_RECLAIM_ACCOUNT)
+        flags |= __GFP_RECLAIMABLE;
+
+    page = alloc_pages_exact_node(nodeid, ...);
+    ......
+}
+
+//file: include/linux/gfp.h
+static inline struct page *alloc_pages_exact_node(int nid, 
+        gfp_t gfp_mask,unsigned int order)
+{
+    return __alloc_pages(gfp_mask, order, node_zonelist(nid, gfp_mask));//最终调用的是伙伴系统的分配空闲块的函数
+}
+```
+![image-20231221194558890](linux网络.assets/image-20231221194558890.png)
+如上图，有专用和通用的kmem_cache。
+![image-20231221195456789](linux网络.assets/image-20231221195456789.png)
+如上图为cat /proc/slabinfo查看内核所有的kmem_cache
+![image-20231221195518920](linux网络.assets/image-20231221195518920.png)
+如上图是slabtop查看按照占用内存大小排列。
+其中size指一个obj的大小，objperslab表示一个slab对应的obj数量，最后pagesperslab即一个slab对应多少页。可验证前面两个参数。
+slab管理器提供若干接口函数：
+```c
+kmem_cache_create: 方便地创建一个基于 slab 的内核对象管理器。
+kmem_cache_alloc: 快速为某个对象申请内存
+kmem_cache_free: 归还对象占用的内存给 slab 管理器
+```
+### 小结
+![image-20231221201003023](linux网络.assets/image-20231221201003023.png)
+如上，内存分为node，zone，伙伴系统管理页。以及内核为自己打造的高效管理内存分配slab机制，有专用和通用的kmem_cache，可以使用kmem_cache的相关函数来处理，如kmem_cache_create,...alloc,...free等。slab分配器不是没有内存碎片，而是器内存碎片很小几乎没有，相比于高性能可以省略掉。
+## TCP连接相关内核对象
