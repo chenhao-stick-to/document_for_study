@@ -2992,3 +2992,475 @@ kmem_cache_free: 归还对象占用的内存给 slab 管理器
 ![image-20231221201003023](linux网络.assets/image-20231221201003023.png)
 如上，内存分为node，zone，伙伴系统管理页。以及内核为自己打造的高效管理内存分配slab机制，有专用和通用的kmem_cache，可以使用kmem_cache的相关函数来处理，如kmem_cache_create,...alloc,...free等。slab分配器不是没有内存碎片，而是器内存碎片很小几乎没有，相比于高性能可以省略掉。
 ## TCP连接相关内核对象
+socket的创建方式有两种，一种是调用socket函数，一种是调用accept函数返回一个socket对象。
+```c
+int __sock_create(struct net *net, int family, int type, int protocol,
+			 struct socket **res, int kern)
+{
+	int err;
+	struct socket *sock;
+	const struct net_proto_family *pf;
+
+	......
+	/*
+	 *	Allocate the socket and allow the family to set things up. if
+	 *	the protocol is 0, the family is instructed to select an appropriate
+	 *	default.
+	 */
+	sock = sock_alloc();//申请sokcet内核对象
+    ......
+	rcu_read_lock();
+	pf = rcu_dereference(net_families[family]);
+	err = -EAFNOSUPPORT;
+	if (!pf)
+		goto out_release;
+
+	/*
+	 * We will call the ->create function, that possibly is in a loadable
+	 * module, so we have to bump that loadable module refcnt first.
+	 */
+	if (!try_module_get(pf->owner))
+		goto out_release;
+
+	/* Now protected by module ref count */
+	rcu_read_unlock();
+	err = pf->create(net, sock, protocol, kern);//调用协议簇的创建函数创建sock
+	......
+}
+
+//sock_alloc()函数，包含socket对象以及将socket和inode关联起来
+struct aock_alloc{
+    struct socket socket;
+    struct inode vfs_inode;
+}
+
+//其中slab中有专门存储struct socket_alloc对象的skab缓存，即sock_inode_cache,在init_inodecache进行初始化
+static int init_inodecache(void)
+{
+	sock_inode_cachep = kmem_cache_create("sock_inode_cache",
+					      sizeof(struct socket_alloc),
+					      0,
+					      (SLAB_HWCACHE_ALIGN |
+					       SLAB_RECLAIM_ACCOUNT |
+					       SLAB_MEM_SPREAD),
+					      init_once);
+	if (sock_inode_cachep == NULL)
+		return -ENOMEM;
+	return 0;
+}
+
+//sock_alloc-》new_inode_pseudo->alloc_inode->sock_alloc_inode,这样完成sock_alloc对象的申请
+static struct inode *sock_alloc_inode(struct super_block *sb)
+{
+	struct socket_alloc *ei;
+	struct socket_wq *wq;
+
+	ei = kmem_cache_alloc(sock_inode_cachep, GFP_KERNEL);//从sock_inode_cachep这个slab中申请一个新的socket_alloc对象
+	if (!ei)
+		return NULL;
+	wq = kmalloc(sizeof(*wq), GFP_KERNEL);//这里申请的是socket的等待队列，进程挂起，申请一个等待队列项，包含进程描述符以及回调函数
+	if (!wq) {
+		kmem_cache_free(sock_inode_cachep, ei);
+		return NULL;
+	}
+	......
+	return &ei->vfs_inode;
+}
+```
+**TCP对象申请:**
+```c
+//pf协议簇对应的是这个数据结构，所以pf->create函数会对应着inet_create函数。
+static const struct net_proto_family inet_family_ops = {
+	.family = PF_INET,
+	.create = inet_create,
+	.owner	= THIS_MODULE,
+};
+
+//inet_init将申请一个TCP的slab缓存，这个函数是在inet_create之前早就初始化好的，意味着tcp_sock的slab缓存对象早就创建好了
+static int __init inet_init(void)
+{
+	struct sk_buff *dummy_skb;
+	struct inet_protosw *q;
+	struct list_head *r;
+	int rc = -EINVAL;
+
+	BUILD_BUG_ON(sizeof(struct inet_skb_parm) > sizeof(dummy_skb->cb));
+
+	sysctl_local_reserved_ports = kzalloc(65536 / 8, GFP_KERNEL);
+	if (!sysctl_local_reserved_ports)
+		goto out;
+
+	rc = proto_register(&tcp_prot, 1);//其中tcp_prot包含了sock对象
+	if (rc)
+		goto out_free_reserved_ports;
+
+	rc = proto_register(&udp_prot, 1);
+	if (rc)
+		goto out_unregister_tcp_proto;
+
+	rc = proto_register(&raw_prot, 1);
+	......
+}
+
+//对应的tcp_prot对象的数据机构
+struct proto tcp_prot = {
+	.name			= "TCP",
+	.owner			= THIS_MODULE,
+	.close			= tcp_close,
+	.connect		= tcp_v4_connect,
+	.disconnect		= tcp_disconnect,
+	.accept			= inet_csk_accept,
+	.ioctl			= tcp_ioctl,
+	.init			= tcp_v4_init_sock,
+	.destroy		= tcp_v4_destroy_sock,
+	.shutdown		= tcp_shutdown,
+	.setsockopt		= tcp_setsockopt,
+	.getsockopt		= tcp_getsockopt,
+	.recvmsg		= tcp_recvmsg,
+	.sendmsg		= tcp_sendmsg,
+	.sendpage		= tcp_sendpage,
+	.backlog_rcv		= tcp_v4_do_rcv,
+    .obj_size		= sizeof(struct tcp_sock),//申请的是tcp_sock内核对象的slab缓存
+	......
+};
+
+//使用proto的相关信息来创建对应的slab，如tcp_proto就申请tcp的slab缓存
+int proto_register(struct proto *prot, int alloc_slab)
+{
+	if (alloc_slab) {
+		prot->slab = kmem_cache_create(prot->name, prot->obj_size, 0,
+					SLAB_HWCACHE_ALIGN | prot->slab_flags,
+					NULL);//这里申请的tcp的slab缓存（对应tcp_sock对象）会记到tcp_proto的slab字段下。
+
+		if (prot->slab == NULL) {
+			printk(KERN_CRIT "%s: Can't create sock SLAB cache!\n",
+			       prot->name);
+			goto out;
+		}
+    ......
+    }
+    ......
+}
+```
+最后我们在create好一个tcp_sock对象的slab缓存后，就可以使用inet_create后面的函数调用sk_alloc进行内核sock对象的申请
+```c
+static int inet_create(struct net *net, struct socket *sock, int protocol,
+		       int kern)
+{
+	struct sock *sk;
+	struct inet_protosw *answer;
+	struct inet_sock *inet;
+	struct proto *answer_prot;
+	unsigned char answer_flags;
+	char answer_no_check;
+	int try_loading_module = 0;
+	int err;
+    ......
+	sock->ops = answer->ops;
+	answer_prot = answer->prot;//获取的即是tcp_prot,即前面inet_init对应的inet_init的tcp_prot,udp_prot各种协议的prot
+	answer_no_check = answer->no_check;
+	answer_flags = answer->flags;
+	rcu_read_unlock();
+
+	WARN_ON(answer_prot->slab == NULL);
+
+	err = -ENOBUFS;
+	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot);//这里进行sock对象的内存分配
+}
+
+//对应的实际alloc一个sock对象
+struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
+		      struct proto *prot)
+{
+	struct sock *sk;
+
+	sk = sk_prot_alloc(prot, priority | __GFP_ZERO, family);
+	......
+
+	return sk;
+}
+
+static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
+		int family)
+{
+	struct sock *sk;
+	struct kmem_cache *slab;
+
+	slab = prot->slab;//获取了inet_init初始化的时候，对应的tcp_prot的创建的slab缓存对象
+	if (slab != NULL) {
+		sk = kmem_cache_alloc(slab, priority & ~__GFP_ZERO);//这里调用alloc从slab缓存中申请一个tcp_sock对象。
+		if (!sk)
+			return sk;
+		if (priority & __GFP_ZERO) {
+			if (prot->clear_sk)
+				prot->clear_sk(sk, prot->obj_size);
+			else
+				sk_prot_clear_nulls(sk, prot->obj_size);
+		}
+	} else
+		sk = kmalloc(prot->obj_size, priority);
+    ......
+}
+```
+**dentry申请**：
+```c
+SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
+{
+	int retval;
+	struct socket *sock;
+	int flags;
+
+	retval = sock_create(family, type, protocol, &sock);//除创建socket外还有，sock_map_fd。
+	if (retval < 0)
+		goto out;
+
+	retval = sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
+	if (retval < 0)
+		goto out_release;
+    ......
+}
+
+//下面是dentry的数据结构
+struct dentry {
+	/* RCU lookup touched fields */
+	unsigned int d_flags;		/* protected by d_lock */
+	seqcount_t d_seq;		/* per dentry seqlock */
+	struct hlist_bl_node d_hash;	/* lookup hash list */
+	struct dentry *d_parent;	/* parent directory */
+	struct qstr d_name;
+	struct inode *d_inode;		/* Where the name belongs to - NULL is
+					 * negative */
+	unsigned char d_iname[DNAME_INLINE_LEN];	/* small names */
+
+	/* Ref lookup also touches following */
+	unsigned int d_count;		/* protected by d_lock */
+	spinlock_t d_lock;		/* per dentry lock */
+	const struct dentry_operations *d_op;
+	struct super_block *d_sb;	/* The root of the dentry tree */
+	unsigned long d_time;		/* used by d_revalidate */
+	void *d_fsdata;			/* fs-specific data */
+    ......
+};
+
+//内核在初始化的时候创建好一个dentry slab缓存，所有的dentry对象在这里分配
+static void __init dcache_init(void)
+{
+	int loop;
+
+	/* 
+	 * A constructor could be added for stable state like the lists,
+	 * but it is probably not worth it because of the cache nature
+	 * of the dcache. 
+	 */
+	dentry_cache = KMEM_CACHE(dentry,
+		SLAB_RECLAIM_ACCOUNT|SLAB_PANIC|SLAB_MEM_SPREAD);//这里调用kemem_cache_create函数来创建一个dentry的slab缓存对象
+	
+	register_shrinker(&dcache_shrinker);
+    ...... 
+}
+
+//进入sock_map_fd函数
+int sock_map_fd(struct socket *sock, int flags)
+{
+	struct file *newfile;
+	int fd = sock_alloc_file(sock, &newfile, flags);//这里完成内核对象的申请
+
+	if (likely(fd >= 0))
+		fd_install(fd, newfile);
+
+	return fd;
+}
+
+static int sock_alloc_file(struct socket *sock, struct file **f, int flags)
+{
+	struct qstr name = { .name = "" };
+	struct path path;
+	struct file *file;
+	int fd;
+
+	path.dentry = d_alloc_pseudo(sock_mnt->mnt_sb, &name);//这里完成的是dentry对象的内存申请
+	if (unlikely(!path.dentry)) {
+		put_unused_fd(fd);
+		return -ENOMEM;
+	}
+	path.mnt = mntget(sock_mnt);
+
+	d_instantiate(path.dentry, SOCK_INODE(sock));
+	SOCK_INODE(sock)->i_fop = &socket_file_ops;
+
+	file = alloc_file(&path, FMODE_READ | FMODE_WRITE,
+		  &socket_file_ops);//这里完成的file对象的内存申请，放到后面
+	......
+	return fd;
+}
+
+//进行dentr内核对象内存申请的函数
+struct dentry *d_alloc_pseudo(struct super_block *sb, const struct qstr *name)
+{
+	struct dentry *dentry = d_alloc(NULL, name);
+	if (dentry) {
+		dentry->d_sb = sb;
+		d_set_d_op(dentry, dentry->d_sb->s_d_op);
+		dentry->d_parent = dentry;
+		dentry->d_flags |= DCACHE_DISCONNECTED;
+	}
+	return dentry;
+}
+
+struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+{
+	struct dentry *dentry;
+	char *dname;
+
+	dentry = kmem_cache_alloc(dentry_cache, GFP_KERNEL);//这里完成dentry对象的slab缓存的内存申请
+	if (!dentry)
+		return NULL;
+    ......
+}
+```
+
+**fiip对象申请（struct file）**
+正如上面的sock_alloc和tcp_sock对象有自己对应的sock_inode_cache和tcp两个slab缓存对应，对应于外层的file对象，也有自己的slab缓存对应，struct file通过flip slab缓存管理。
+其在sock_map_fd的sk_alloc_file下的allo_file进行内核file对象的内存分配
+```c
+void __init files_init(unsigned long mempages)
+{ 
+	unsigned long n;
+
+	filp_cachep = kmem_cache_create("filp", sizeof(struct file), 0,
+			SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);//这里create一个flip的slab缓存对象
+
+	/*
+	 * One file with associated inode and dcache is very roughly 1K.
+	 * Per default don't use more than 10% of our memory for files. 
+	 */ 
+    ......
+} 
+
+//对应的alloc_file申请一个file对象
+struct file *alloc_file(struct path *path, fmode_t mode,
+		const struct file_operations *fop)
+{
+	struct file *file;
+
+	file = get_empty_filp();
+	if (!file)
+		return NULL;
+
+	file->f_path = *path;
+	file->f_mapping = path->dentry->d_inode->i_mapping;
+	file->f_mode = mode;
+	file->f_op = fop;
+
+	......
+	return file;
+}
+
+//
+struct file *get_empty_filp(void)
+{
+	const struct cred *cred = current_cred();
+	static long old_max;
+	struct file * f;
+    ......
+	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);//创建一个专门存储file内核对象的slab缓存
+	if (f == NULL)
+		goto fail;
+
+}
+```
+**小结**
+![0D8CF1E936FE2ED54A4A7389953FBFC2](linux网络.assets/0D8CF1E936FE2ED54A4A7389953FBFC2.jpg)
+如上图展示了socket的内核对象中各个部分和slab缓存的关系。首先是file和denty其都是在socket_create的socket_max_fd的sock_alloc_file和alloc_file,即flip，denty的slab缓存。
+以及在sock_alloc中sock_alloc_inode分配的sock_inode_cache的内存，和socket_create的对应的inet_create的sk_prot_alloc申请tcp_sock内核对象内存。
+### 服务端直接创建
+除直接创建，服务端可通过accept函数在接收连接请求完成内核对象创建。
+```c
+//为accept的系统调用
+SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
+		int __user *, upeer_addrlen, int, flags)
+{
+	struct socket *sock, *newsock;
+	struct file *newfile;
+	int err, len, newfd, fput_needed;
+	struct sockaddr_storage address;
+    ......
+    //根据fd查找到监听的socket
+	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	if (!sock)
+		goto out;
+
+	err = -ENFILE;
+    //申请并且初始化新的socket
+	newsock = sock_alloc();
+	if (!newsock)
+		goto out_put;
+
+	newsock->type = sock->type;
+	newsock->ops = sock->ops;
+
+	/*
+	 * We don't need try_module_get here, as the listening socket (sock)
+	 * has the protocol module (sock->ops->owner) held.
+	 */
+	__module_get(newsock->ops->owner);
+    //这里是申请新的file对象，设置到新的socket上
+	newfd = sock_alloc_file(newsock, &newfile, flags);
+	if (unlikely(newfd < 0)) {
+		err = newfd;
+		sock_release(newsock);
+		goto out_put;
+	}
+	err = security_socket_accept(sock, newsock);
+	if (err)
+		goto out_fd;
+        //接收连接
+	err = sock->ops->accept(sock, newsock, sock->file->f_flags);
+	......
+
+	/* File flags are not inherited via accept() unlike another OSes. */
+    //将新的文件添加到当前进程的打开文件列表
+	fd_install(newfd, newfile);
+	err = newfd;
+    ......
+}
+```
+由上述代码可知，file，dentry以及sock_alloc内核对象的申请都是和socket_create一样的，但是对tcp_sock的申请，不再是用的pf->create调用函数创建，而是在全连接队列中已经有了sock对象，所以只需要从全连接队列中取出来直接使用即可，不用再申请slab缓存。
+```c
+struct sock *inet_csk_accept(struct sock *sk, int flags, int *err)
+{
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct sock *newsk;
+	int error;
+
+	lock_sock(sk);
+
+	/* We need to make sure that this socket is listening,
+	 * and that it has something pending.
+	 */
+	error = -EINVAL;
+	if (sk->sk_state != TCP_LISTEN)
+		goto out_err;
+    ......
+    //这里直接获取该套接字的全连接队列的sock对象，并且返回这个新的sock对象
+	newsk = reqsk_queue_get_child(&icsk->icsk_accept_queue, sk);
+	WARN_ON(newsk->sk_state == TCP_SYN_RECV);
+out:
+	release_sock(sk);
+	return newsk;
+out_err:
+	newsk = NULL;
+	*err = error;
+	goto out;
+}
+```
+## 实测TCP内核对象开销
+本小结主要是实验形式来做实际测试。
+![image-20231222171328276](linux网络.assets/image-20231222171328276.png)
+![image-20231222171341543](linux网络.assets/image-20231222171341543.png)
+如上图展示了客户端和服务段的连接示意图。
+值得注意的是再slabtop中可能不会显示flip，tcp_bind_bucket等slab缓存，而显示kmalloc-xx,是因为linux内部的slab merging功能将同等大小的slab缓存放在了一起。
+对于客户端和服务端的内存开销，客户端包含socket_wq（0.06KB）,dentry（0.19KB）,kmalloc-256(flip合并，0.25KB)，sock_inode_cache(0.62KB),TCP是1.94KB，总的为3.06KB，还有tcp_bind_bucket，保存端口使用的哈希表。
+总的差不多比3.06KB大一点。
+对于服务端，由于不用理会tcp_bind_bucket的内存开销，所以其内存开销要多一点。
+### 观察非ESTABLISH状态开销
