@@ -950,3 +950,254 @@ schedule_timeout()设置定时器，然后调用schedule()进行调用。
 # 第12章 内存管理
 内核和用户空间不同，不支持简单便捷的内存分配方式，内核一般不能睡眠，处理内存分配错误也比较难。
 ## 页
+处理器最小可寻址单位通常是字/字节。内存管理单元MMU把虚拟内存转换为物理地址的硬件，以页为单位进行处理。
+```c
+struct page {
+	unsigned long flags;//存放页的状态，如页是否脏，是否锁页。每一位表示一种状态，至多就是32种。
+	atomic_t _count;//页的引用计数，分配页时可使用
+	atomic_t _mapcount;//
+	unsigned long private;//
+	struct address_space *mapping;//页可由页缓存使用，mapping可指向和这个页关联的address_sapce对象。或作为私有数据由private。
+	pgoff_t index;
+	struct list_head lru;
+	void *virtual;//页的虚拟地址，可能是动态的映射这些页。
+}
+```
+内核用page数据结构描述==当前时刻在相关物理页中存放的东西==。
+## 区
+硬件限制，内核需要区分各种页，有些页在特定物理地址上如（DMA，DMA32）。所以内核把页划分为不同区（zone）。
+硬件缺陷导致的内存寻址问题：
+- 一些硬件只能用特定的内存地址来执行DMA（直接内存访问，只能访问低地址的内存）
+- 一些体系结构的内存的物理寻址范围大于虚拟寻址。
+为此linux主要使用四种zone:
+ZONE_DMA:能执行DMA操作，这个zone的页
+ZONE_DMA32:除只能被32位设备访问外，其他和ZONE_DMA相同。
+ZONE_NORMAL:包含正常映射的页。
+ZONE_HIGHEM:包含”高端内存“（无法在内核虚拟地址空间直接访问的物理内存），页不能永久的映射到内核地址空间。
+![image-20231225171850938](linux内核设计与实现.assets/image-20231225171850938.png)
+如上如为x86/32位系统的区以及对应的物理内存区域。
+尽管用于DMA的内存必须从ZONE_ DMA中进行分配，但是一般用途的内存却既能从ZONE_DMA分配，也能从ZONE_ NORMAL分配，不过不可能同时从两个区分配，因为分配是不能跨区界限的。
+```c
+struct zone {
+	/* Fields commonly accessed by the page allocator */
+
+	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	unsigned long watermark[NR_WMARK];//持有这个zone的最小值，最低和最高水位值。内核使用水位线标识内存消耗基础，从而使用不同的内存分配策略。
+	unsigned long percpu_drift_mark;
+	unsigned long		lowmem_reserve[MAX_NR_ZONES];
+
+#ifdef CONFIG_NUMA
+	int node;
+	/*
+	 * zone reclaim becomes active if more unmapped pages exist.
+	 */
+	unsigned long		min_unmapped_pages;
+	unsigned long		min_slab_pages;
+#endif
+	struct per_cpu_pageset __percpu *pageset;
+	/*
+	 * free areas of different sizes
+	 */
+	spinlock_t		lock;//这个域时一个自旋锁，防止该结构的并发访问。只是针对这个结构，而不是这个区里的页的访问。
+	int                     all_unreclaimable; /* All pages pinned */
+#ifdef CONFIG_MEMORY_HOTPLUG
+	/* see spanned/present_pages for more description */
+	seqlock_t		span_seqlock;
+#endif
+	struct free_area	free_area[MAX_ORDER];
+
+#ifndef CONFIG_SPARSEMEM
+	/*
+	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
+	 * In SPARSEMEM, this map is stored in struct mem_section
+	 */
+	unsigned long		*pageblock_flags;
+#endif /* CONFIG_SPARSEMEM */
+
+#ifdef CONFIG_COMPACTION
+	/*
+	 * On compaction failure, 1<<compact_defer_shift compactions
+	 * are skipped before trying again. The number attempted since
+	 * last failure is tracked with compact_considered.
+	 */
+	unsigned int		compact_considered;
+	unsigned int		compact_defer_shift;
+#endif
+
+	ZONE_PADDING(_pad1_)
+
+	/* Fields commonly accessed by the page reclaim scanner */
+	spinlock_t		lru_lock;	
+	struct zone_lru {
+		struct list_head list;
+	} lru[NR_LRU_LISTS];
+
+	struct zone_reclaim_stat reclaim_stat;
+
+	unsigned long		pages_scanned;	   /* since last reclaim */
+	unsigned long		flags;		   /* zone flags, see below */
+
+	/* Zone statistics */
+
+	unsigned int inactive_ratio;
+
+
+	ZONE_PADDING(_pad2_)
+	wait_queue_head_t	* wait_table;
+	unsigned long		wait_table_hash_nr_entries;
+	unsigned long		wait_table_bits;
+
+	/*
+	 * Discontig memory support fields.
+	 */
+	struct pglist_data	*zone_pgdat;
+	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
+	unsigned long		zone_start_pfn;
+
+	 */
+	unsigned long		spanned_pages;	/* total size, including holes */
+	unsigned long		present_pages;	/* amount of memory (excluding holes) */
+
+	/*
+	 * rarely used fields:
+	 */
+	const char		*name;//以NULL结束的字符串，内核启动初始化这个值。
+} ____cacheline_internodealigned_in_smp;
+```
+## 获得页
+![image-20231225173301491](linux内核设计与实现.assets/image-20231225173301491.png)
+上面是页的各种分配方法。
+释放页的方法：
+![image-20231225173744924](linux内核设计与实现.assets/image-20231225173744924.png)
+如上是有三个方法来释放它们。
+```c
+//一个简易的例子：
+unsigned long page;
+page = __get_free_pages(GFP_KERNEL,3);//这里返回的是用户空间的逻辑地址，（分配了8个页，返回第一个物理页的page里的逻辑地址）
+if(!page){//一般来说程序分配一个东西尽量放在前面，防止程序分配失败，导致做无用功。
+	/*处理这种错误*/
+}
+......
+free_page(page,3);//这里释放page的逻辑地址对应的物理页关联的8个页。请注意这里的order需要和分配对应起来，内核没有报错机制，出错后只是将进程挂起。
+/*页已经释放，不能再访问page的地址*/
+```
+## kmalloc()
+以字节单位分配。对于大多数内核分配，kmalloc()用的更多。
+```c
+void *kmalloc(size_t size,gfp_t flags);//返回一个指向指定size的连续物理内存块的指针，分配不成功返回NULL。
+```
+- gfp_mask标志
+页分配，kmalloc都需要这个标志。可分为：行为修饰符（如分配器能否睡眠，各种权限），区修饰符（用于指明在哪个区分配），类型（组合行为修饰符和区修饰符。）
+![image-20231225180037610](linux内核设计与实现.assets/image-20231225180037610.png)
+![image-20231225180044163](linux内核设计与实现.assets/image-20231225180044163.png)
+以上是行为修饰符的。
+可同时指定上面所述标志。
+```c
+ptr = kmalloc(size,__GFP_WAIT| __GFP_IO| __GFP_FS);//在分配时，可睡眠，执行IO，执行文件系统操作。
+```
+![image-20231225180334122](linux内核设计与实现.assets/image-20231225180334122.png)
+以上是区修饰符的标志。
+==不能给__get_free_pages()或者kalloc()指定ZONE_HIGHMEM,前面返回的是逻辑地址，可能这两个函数分配的内存当前还没映射到内核的虚拟地址空间（高内存空间需要一个虚存和物理内存的实际映射过程）。所以分配HIGHMEN应该使用alloc_pages()直接返回页的结构==
+![image-20231225220427241](linux内核设计与实现.assets/image-20231225220427241.png)
+以上是类型标志描述
+![image-20231225220831918](linux内核设计与实现.assets/image-20231225220831918.png)
+以上是类型描述符后面的行为/区修饰符
+GFP_ATOMIC，不允许调用者睡眠（在内存紧缺时，其他进程不能释放内存，调用失败率更高）；GFP_KERNEL，允许调用者睡眠。
+GFP_NOIO,绝不使用磁盘IO；GFP_NOFS绝不启动文件系统IO。
+![image-20231225221418684](linux内核设计与实现.assets/image-20231225221418684.png)
+以上描述了何时用哪种标志。
+- kfree()
+```c
+void kfree(const void *ptr);
+//kfree释放kmalloc分配的内存块，内存的分配和回收需要配对使用，kfree(NULL)安全的
+```
+## vmalloc()
+kmalloc()确保地址在虚拟和物理内存都是连续的，但是vmalloc()确保分配内存在虚拟地址连续，但在物理地址不连续。显然这个方式符合malloc()函数。
+vmalloc()需要为每一个物理页建立和虚拟内存的映射页表项，且需要一个一个的映射，导致了比直接内存映射大得多的TLB抖动。vmalloc()适用于分配大块内存的时候。
+```c
+//常用的分配/释放内存的函数，分配返回的也是逻辑地址.
+void *vmalloc(unsigned long size);//可睡眠故不可以在中断下进行适用，
+void vfree(const void *addr);
+```
+## slab层
+空闲链表是常用结构，可供使用的，已经分配好的数据结构块。但是其不能全局控制，可用内存紧缺时，内核无法通知每个空闲链表去收缩链表来释放内存。于是slab层被提了出来。
+slab层的设计充分考虑的基本原则：
+- 频繁使用的数据结构也会频繁分配和释放，因此应当缓存它们。
+- 频繁分配和回收必然会导致内存碎片(难以找到大块连续的可用内存)。为了避免这种现象，空闲链表的缓存会连续地存放。因为已释放的数据结构又会放回空闲链表，因此不会导致碎片。
+- 回收的对象可以立即投入下一次分配，因此，对于频繁的分配和释放，空闲链表能够提高
+其性能。
+- 如果分配器知道对象大小、页大小和总的高速缓存的大小这样的概念，它会做出更明智的决策。
+- 如果让部分缓存专属于单个处理器(对系统上的每个处理器独立而唯一)，那么，分配和释放就可以在不加SMP锁的情况下进行。
+- 如果分配器是与NUMA相关的，它就可以从相同的内存节点为请求者进行分配。
+- 对存放的对象进行着色(color)， 以防止多个对象映射到相同的高速缓存行( cache line )。缓存一致性导致同一缓存行的其他对象的访问也会被锁住。
+### slab层的设计
+内核某一部分需要一个新对象时，先从部分满的slab中进行分配，如果没有部分满的slab再从空的slab中分配。
+```c
+//slab的数据结构
+struct slab {
+	struct list_head list;//部分，满，空链表
+	unsigned long colouroff;//slab着色偏移量
+	void *s_mem;//slab中的第一个对象
+	unsigned int inuse;//slab中已分配的对象数
+	kmem_bufctl_t free;//第一个空闲对象
+}
+```
+可以使用kmem_getpages()和kmem_freepages()来分配创建slab和释放内存。kmem_getpages底层是通过get_free_pages来分配slab的页，而且kmem_getpages返回的也是get_free_pages的逻辑地址。
+### slab分配器的接口
+kmem_cache_create(const char *name,size_t size,size_t align,unsigned long flags,void (*ctor)(void *))//第一个参数是高速缓存名；第二个参数是高速缓存每个元素大小，第三个参数是slab内第一个对象的偏移（确保页内对齐）。flags参数可选项：
+SLAB_HWCACHE_ALIGN:用于将slab层的所有对象按高速缓存行进行对齐，提升性能，应为同一高速缓存行需要保证缓存一致性。
+![image-20231226110544061](linux内核设计与实现.assets/image-20231226110544061.png)
+kmem_cache_destroy(struct kmem_cache *cachep);
+在撤销给定高速缓存时，需确保以下两个条件：
+- 高速缓存中所有的slab必须为空。
+- 调用这个撤销函数，不再访问这个高速缓存，调用者需确保这种同步。
+可调用kmem_cache_alloc和kmem_cache_free函数来从给定的高速缓存区来分配对象以及释放归还对象。
+## 在栈上的静态分配
+内核栈不像用户栈那样大而且可动态增长。内核栈通常只有两页大小。
+### 单页内核栈
+单页内核栈可减少进程内存消耗，随着程序运行，连续页分配越来越困难。中断处理程序和被中断进程不再使用同一个栈，中断处理程序在中断栈中运行。
+### 在栈上工作
+在内核上进行大量的静态分配（分配大型数组或大型结构体）是危险的，很可能会造成栈溢出，从而造成机器宕机或者悄无声息的影响栈外面的数据。
+## 高端内存的映射
+x86体系结构下，高端内存并不会永久或自动的映射到内核地址空间。需要额外的映射页。
+### 永久映射
+映射一个给定的page结构到内核地址空间。
+void *kmap(struct page *page)
+函数可在高端/低端内存中使用；page是低端内存的页，则会返回该页的虚拟地址；如果页在高端内存，会建立一个永久映射，返回地址。函数可睡眠，不可用在中断上下文。
+==不需要高端内存时，需要解除映射，使用void kunmap(struct page *page)==
+### 临时映射
+需要创建一个映射，且不能睡眠，提供临时映射。内核可以原子的把高端内存中的一个页映射到某个保留的映射中。所以临时映射可以用在不能睡眠的地方。
+void *kmap_atomic(struct page *page,enum km_type type);它也禁止内核抢占。防止下一个临时映射覆盖掉。
+void *kunmap_atomic(void *kvaddr,enum km_type type);
+一般来说，内核不激活抢占的话，kmap_atomic()根本无事可做。因为下一个进程的临时映射会自然的覆盖前一个映射。但激活了内核抢占的话，就需要仔细保护这个临时映射了。
+## 每个CPU的分配
+一般来说，每个CPU的数据存放在一个数组中，数组中的每一项对应着一个存在的处理器。
+```c
+unsigned long my_percpup[NR_CPUS];
+int cpu;
+cpu=get_cpu();//使用当前处理器，禁止内核抢占
+my_percpup[cpu]++;//因为不可能其他cpu访问这个cpu上的这个变量，对于并发只需要考虑内核抢占带来的竞争性问题。于是禁止内核抢占可以使这个数据的访问没有并发竞争性
+put_cpu();//激活内核抢占
+```
+## 新的每个CPU的接口
+方便创建和操作每个CPU的数据，引进了新的操作接口,即percpu。
+```c
+DEFINE_PER_CPU(type,name);//定义类型和变量名称。
+get_cpu_var(name)++;//禁止抢占，获得值加1
+put_cpu_var(name);//恢复抢占
+per_cpu(name,cpu)++;//获得指定cpu上name变量。注意同步上锁。
+```
+### 运行时的每个CPU数据
+![image-20231226201145519](linux内核设计与实现.assets/image-20231226201145519.png)
+![image-20231226201153238](linux内核设计与实现.assets/image-20231226201153238.png)
+如上图所示展示了内核为每个CPU数据的动态分配方法返回一个指针，用来间接引用动态创建的每个CPU的数据。可用这个指针访问每个CPU的数据。
+## 使用每个CPU数据的原因
+首先减少了锁的使用，只用考虑同一个处理器的内核抢占问题。使用单处理器数据，减小数据失效问题，原因是多个处理器访问同一共享数据时由于缓存一致性的原因，会导致缓存行失效概率大，但是用单处理器，则可安排在不同cache行，减少这种冲突。
+综上，percpu数据最小化上锁需求，只需禁止内核抢占（API集成进去了）。每个CPU的数据在中断上下文或进程上下文使用安全，只是在访问percpu数据不能睡眠，防止醒来后在其他处理器，不能访问这个变量等。
+## 分配函数的选择
+- 连续物理页，kmalloc()或者低级页分配器。
+- 高端内存，alloc_pages,返回指向page结构的指针，未获得逻辑空间可用的指针，可调用kmap/kamp_atomic进行page到逻辑地址的映射。
+- 仅需要虚拟地址连续的页，使用vmalloc()函数进行分配。
+- slab高速缓存，需要频繁的分配回收内存，且分配对象较小时，建立slab高速缓存，由三个空闲链表组成，每个结点是一个slab结点，有许多对象构成。
+# 第13章 虚拟文件系统
+
