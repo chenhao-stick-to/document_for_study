@@ -1200,4 +1200,246 @@ per_cpu(name,cpu)++;//获得指定cpu上name变量。注意同步上锁。
 - 仅需要虚拟地址连续的页，使用vmalloc()函数进行分配。
 - slab高速缓存，需要频繁的分配回收内存，且分配对象较小时，建立slab高速缓存，由三个空闲链表组成，每个结点是一个slab结点，有许多对象构成。
 # 第13章 虚拟文件系统
+VFS即虚拟文件系统作为内核子系统为用户应用程序提供文件和文件系统相关的接口。
+虚拟文件系统将底层不同文件格式的硬盘抽象出来统一用vfs来操作，即可用统一命令操作不同文件系统，不同物理介质上的数据。
+## 通用文件系统接口
+vfs为不同的物理介质（块IO实现统一），不同文件系统提供统一的访问接口（这正式os的职能之一）。块IO层支持各种各样的存储设备，。vfs与块IO结合，提供抽象，接口，使用用户程序可调用统一的系统调用访问各种文件。
+## 文件系统抽象层
+![image-20231227144648205](linux内核设计与实现.assets/image-20231227144648205.png)
+首先用户空间调用write(),再调用系统通用调用sys_write()（VFS实现的），再到文件系统（具体的文件系统，如FAT，EXT3等），最后再到具体的物理介质（块IO模块）。】
+## Unix文件系统
+Unix四种和文件系统相关的抽象概念：文件，目录项，索引结点，安装点（mount point）。
+linux统一文件命名空间，都在根目录下，构成了一个文件树。而Windows/DOS则是划分为C，D等这种分区，但是这样硬件细节就暴露给了文件系统抽象层。
+unix将文件描述信息和文件数据加以区分，文件信息存储在单独的数据结构中，称为索引节点。
+在磁盘上，文件信息按照索引节点形式存储在单独的块中，控制信息集中存储在磁盘的超级块中。尽管VFS可以封装各种文件系统，如NTFS，FAT这样的非UNIX系统，但是呢,不同文件系统需要一种适应于VFS的各种形式（文件格式，将目录转化成文件等）的转换。
+## VFS对象及其数据结构
+超级块对象（具体已安装文件系统），索引节点对象（一个具体文件），目录项对象（路径一个组成部分），文件对象（进程打开文件）。对于四种主要对象类型，vfs分别提供一个操作对象（即各种创建，写，删除等对应操作的集合），其实是一个C语言的有效简洁实现OOP的例子。
+## 超级块对象
+超级块对象用来存储特定文件系统的信息，一般在==磁盘特定扇区的文件系统的超级块或文件系统控制块==。
+```c
+struct super_block {
+	struct list_head	s_list;		/* Keep this first */
+	dev_t			s_dev;		/* search index; _not_ kdev_t */
+	unsigned char		s_dirt;
+	unsigned char		s_blocksize_bits;
+	unsigned long		s_blocksize;
+	loff_t			s_maxbytes;	/* Max file size */
+	struct file_system_type	*s_type;
+	const struct super_operations	*s_op;
+	const struct dquot_operations	*dq_op;
+	const struct quotactl_ops	*s_qcop;
+	const struct export_operations *s_export_op;
+	unsigned long		s_flags;
+	unsigned long		s_magic;
+	struct dentry		*s_root;
+	struct rw_semaphore	s_umount;
+	struct mutex		s_lock;
+	int			s_count;
+	atomic_t		s_active;
+#ifdef CONFIG_SECURITY
+	void                    *s_security;
+#endif
+	const struct xattr_handler **s_xattr;
+
+	struct list_head	s_inodes;	/* all inodes */
+	struct hlist_bl_head	s_anon;		/* anonymous dentries for (nfs) exporting */
+#ifdef CONFIG_SMP
+	struct list_head __percpu *s_files;
+#else
+	struct list_head	s_files;
+#endif
+	/* s_dentry_lru, s_nr_dentry_unused protected by dcache.c lru locks */
+	struct list_head	s_dentry_lru;	/* unused dentry lru */
+	int			s_nr_dentry_unused;	/* # of dentry on lru */
+
+	struct block_device	*s_bdev;
+	struct backing_dev_info *s_bdi;
+	struct mtd_info		*s_mtd;
+	struct list_head	s_instances;
+	struct quota_info	s_dquot;	/* Diskquota specific options */
+
+	int			s_frozen;
+	wait_queue_head_t	s_wait_unfrozen;
+
+	char s_id[32];				/* Informational name */
+	u8 s_uuid[16];				/* UUID */
+
+	void 			*s_fs_info;	/* Filesystem private info */
+	fmode_t			s_mode;
+
+	/* Granularity of c/m/atime in ns.
+	   Cannot be worse than a second */
+	u32		   s_time_gran;
+
+	/*
+	 * The next field is for VFS *only*. No filesystems have any business
+	 * even looking at it. You had been warned.
+	 */
+	struct mutex s_vfs_rename_mutex;	/* Kludge */
+
+	/*
+	 * Filesystem subtype.  If non-empty the filesystem type field
+	 * in /proc/mounts will be "type.subtype"
+	 */
+	char *s_subtype;
+
+	/*
+	 * Saved mount options for lazy filesystems using
+	 * generic_show_options()
+	 */
+	char __rcu *s_options;
+	const struct dentry_operations *s_d_op; /* default d_op for dentries */
+};
+//超级块对象可通过alloc_super（）函数进行创建和初始化。文件系统安装调用该函数从磁盘读取该文件系统的超级块填入内存的超级块对象来进行文件系统的使用。
+```
+## 超级块操作
+超级块对象中最重要的是s_op,指向超级块的操作函数表，是由super_operations结构体表示，即前面所述的超级块对象对应的操作对象。
+```c
+struct super_operations {
+   	struct inode *(*alloc_inode)(struct super_block *sb);
+	void (*destroy_inode)(struct inode *);
+
+   	void (*dirty_inode) (struct inode *);
+	int (*write_inode) (struct inode *, struct writeback_control *wbc);
+	int (*drop_inode) (struct inode *);
+	void (*evict_inode) (struct inode *);
+	void (*put_super) (struct super_block *);
+	void (*write_super) (struct super_block *);
+	int (*sync_fs)(struct super_block *sb, int wait);
+	int (*freeze_fs) (struct super_block *);
+	int (*unfreeze_fs) (struct super_block *);
+	int (*statfs) (struct dentry *, struct kstatfs *);
+	int (*remount_fs) (struct super_block *, int *, char *);
+	void (*umount_begin) (struct super_block *);
+
+	int (*show_options)(struct seq_file *, struct vfsmount *);
+	int (*show_devname)(struct seq_file *, struct vfsmount *);
+	int (*show_path)(struct seq_file *, struct vfsmount *);
+	int (*show_stats)(struct seq_file *, struct vfsmount *);
+#ifdef CONFIG_QUOTA
+	ssize_t (*quota_read)(struct super_block *, int, char *, size_t, loff_t);
+	ssize_t (*quota_write)(struct super_block *, int, const char *, size_t, loff_t);
+#endif
+	int (*bdev_try_to_free_page)(struct super_block*, struct page*, gfp_t);
+};
+//在VFS的超级块的操作对象中，文件系统可以将不需要的函数指针设置成NULL，VFS发现该指针为NULL，会调用相应的通用函数或者什么也不做。
+```
+## 索引节点对象
+索引节点对象包含内核在操作文件或目录时的所需的全部信息.
+一个索引节点代表文件系统中的一个文件，可以是设备或管道这样的特殊文件。由于linux万物皆文件的特点，索引节点项有页数文件项，有名管道/块设备结构体。字符设备结构体，一个索引节点一次只能表示三者之一。
+索引节点对象是在vfs中的，可能对于某些具体的文件系统，不会使用到VFS提供的一些数据结构，这时怎样处理这些数据结构或者初始化，赋值，或者文件系统实现者来进行处理。
+## 索引节点操作
+==和面向对象不同的是，c语言编写的结构体，即时是调用自己对象下的函数，也需要传入该对象。==
+即对应的索引节点对象对应的操作对象inode_operations下的函数。
+## 目录项对象
+在一个路径/bin/vi中，每一个项（路径组成部分）都属于一个特殊的文件，可统一由索引节点表示，但是vfs经常有执行目录相关的操作，为了方便路径查找工作引出了目录项概念，在一个路径里，所有的组成部分都是目录项对象，vfs在需要时（执行目录操作）会现场创建目录项对象。
+- 目录项对象有三种有效状态：被使用，未使用，负状态。
+被使用：有一个或多个使用者，不能被丢弃。
+未使用：vfs当前还未使用，但指向有效对象，所以保留在缓存中等待需要时使用。
+负状态，即目录项没有对应的有效的索引节点，路径不正确或者索引节点失效。但目录项还是保留来快速解析后续的路径查询。但必要可以撤销。
+- 目录项缓存
+如果路径中各目录有非常多的子目录或者文件，找到最底层的文件将会非常耗时。
+目录项缓存包括三个主要部分：
+被使用的目录项链表，一个索引节点可能多个路径，所以可能有多个目录项，用一个链表表示。
+最近没被使用的双向链表，含未被使用的和负状态的目录项对象。使用链表，在头部插入目录项，需要回收内存时，总是删除尾部的最旧的节点。
+散列表和散列函数，将给定对象快速解析为相关的目录项对象。
+**在查找路径下文件时，现在目录项缓存中查找有没有对应的路径名，找到最快速，否则就是vfs逐渐遍历文件系统的路径分量解析，最后将目录项加入dcache目录项缓存中**。
+一般来说目录项缓存也提供对索引节点的缓存，一般目录项在缓存中，则对应的索引节点也在内存中缓存着没有被释放。
+## 目录项操作
+目录项的操作对象，dentry_operations。大概有判断目录对象有效性，生成散列表，目录项对象释放等。
+## 文件对象
+表示进程已打开的文件（是在应用程序的层面进行管理的，通常由内核提供的文件描述符或者文件句柄进行表示）。
+索引节点对象时vfs中的，表示文件/目录的元数据信息，（是在os的文件系统层面进行管理的）。
+一个文件对应的文件对象不是唯一的（open打开的FILE对象），但是文件对应的索引节点和目录项对象是唯一的。
+```c
+struct file {
+	/*
+	 * fu_list becomes invalid after file_free is called and queued via
+	 * fu_rcuhead for RCU freeing
+	 */
+	union {
+		struct list_head	fu_list;
+		struct rcu_head 	fu_rcuhead;
+	} f_u;
+	struct path		f_path;//目录项链表
+#define f_dentry	f_path.dentry
+#define f_vfsmnt	f_path.mnt
+	const struct file_operations	*f_op;
+	spinlock_t		f_lock;  /* f_ep_links, f_flags, no IRQ */
+#ifdef CONFIG_SMP
+	int			f_sb_list_cpu;
+#endif
+	atomic_long_t		f_count;
+	unsigned int 		f_flags;
+	fmode_t			f_mode;
+	loff_t			f_pos;
+	struct fown_struct	f_owner;
+	const struct cred	*f_cred;
+	struct file_ra_state	f_ra;
+
+	u64			f_version;
+#ifdef CONFIG_SECURITY
+	void			*f_security;
+#endif
+	/* needed for tty driver, and maybe others */
+	void			*private_data;
+
+#ifdef CONFIG_EPOLL
+	/* Used by fs/eventpoll.c to link all the hooks to this file */
+	struct list_head	f_ep_links;
+#endif /* #ifdef CONFIG_EPOLL */
+	struct address_space	*f_mapping;
+#ifdef CONFIG_DEBUG_WRITECOUNT
+	unsigned long f_mnt_write_state;
+#endif
+};
+//文件对象和目录项对象接没有对应的磁盘数据。文件对象f_dentry指向对应目录项，目录项对象指向相关索引节点，标识文件是否为脏。
+```
+## 文件操作
+```c
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek) (struct file *, loff_t, int);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*aio_read) (struct kiocb *, const struct iovec *, unsigned long, loff_t);
+	ssize_t (*aio_write) (struct kiocb *, const struct iovec *, unsigned long, loff_t);
+	int (*readdir) (struct file *, void *, filldir_t);
+	unsigned int (*poll) (struct file *, struct poll_table_struct *);
+	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+	int (*mmap) (struct file *, struct vm_area_struct *);
+	int (*open) (struct inode *, struct file *);
+	int (*flush) (struct file *, fl_owner_t id);
+	int (*release) (struct inode *, struct file *);
+	int (*fsync) (struct file *, int datasync);
+	int (*aio_fsync) (struct kiocb *, int datasync);
+	int (*fasync) (int, struct file *, int);
+	int (*lock) (struct file *, int, struct file_lock *);
+	ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
+	unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+	int (*check_flags)(int);
+	int (*flock) (struct file *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	int (*setlease)(struct file *, long, struct file_lock **);
+	long (*fallocate)(struct file *file, int mode, loff_t offset,
+			  loff_t len);
+};
+//如上即为文件对象的操作对象的函数集合
+```
+## 和文件系统相关的数据结构
+除了以上四种VFS的基础对象，还有一些标准数据结构管理其他数据。
+file_system_type:描述特定的文件系统类型（每种文件系统不管在内核的实例有多少个，都只有一个file_system_type结构），vfsmount负责代表一个文件系统的实例（vfsmount结构体在安装点被创建）。在安装时，指定标志信息。
+![image-20240102173506978](linux内核设计与实现.assets/image-20240102173506978.png)
+## 和进程相关的数据结构
+系统进程每一个有对应的一组打开文件。有三个数据结构将vfs层和系统进程紧密联系在一起。file_struct,fs_struct,和namespace结构体。
+- file_struct，由进程描述符中的files目录项指向，所有与单个进程相关的信息（打开文件/文件描述符）都在其中。
+- fs_struct,由进程描述符的fs域指向，包含文件系统和进程相关的信息。（包含当前进程的工作目录，根目录）
+- namesapce结构体，由进程描述符的mmt_namespace域指向，可使每个进程在系统看到唯一的安装文件系统。
+file_struct和fs_struct来说，多数进程有唯一的，克隆标志进程（子进程创建时等）会共享这两个结构体。
+对于namespace结构体，所有进程共享同样的命名空间（从相同的挂载表看到同一个文件系统），只有clone时会给进程一个唯一的命名空间结构体的拷贝（所以子进程一般继承使用父进程的命名空间结构体）。
+# 第14章 块I/O层
+
+
 
