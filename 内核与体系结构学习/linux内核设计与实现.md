@@ -1440,6 +1440,115 @@ file_system_type:描述特定的文件系统类型（每种文件系统不管在
 file_struct和fs_struct来说，多数进程有唯一的，克隆标志进程（子进程创建时等）会共享这两个结构体。
 对于namespace结构体，所有进程共享同样的命名空间（从相同的挂载表看到同一个文件系统），只有clone时会给进程一个唯一的命名空间结构体的拷贝（所以子进程一般继承使用父进程的命名空间结构体）。
 # 第14章 块I/O层
+块设备：可以随机访问数据。内核管理块设备比字符设备细致，有额外的子系统进行管理。
+字符设备：单字符访问，按流形式进行访问。
+## 剖析一个块设备
+块设备最小的可寻址单元为扇区。
+块大小通常是2的整数倍扇区，小于等于页面大小。（512B，1KB，4KB）
+==设备最小寻址单元是扇区，文件系统最小寻址单元是块。==
+## 缓冲区和缓冲区头
+块调入内存（读入或者写出），存储在缓冲区。一个块和一个缓冲区对应。一个缓冲区用buffer_head结构体的描述符对应。
+```c
+struct buffer_head {
+	unsigned long b_state;		/* buffer state bitmap (see ,描述缓冲区状态标志above) */
+	struct buffer_head *b_this_page;/* circular list of page's buffers */
+	struct page *b_page;//存储缓冲区页面		/* the page this bh is mapped to */
 
+	sector_t b_blocknr;		/* start block number */
+	size_t b_size;			/* size of mapping */
+	char *b_data;			/* pointer to data within the page */
 
+	struct block_device *b_bdev;
+	bh_end_io_t *b_end_io;		/* I/O completion */
+ 	void *b_private;		/* reserved for b_end_io */
+	struct list_head b_assoc_buffers; /* associated with another mapping */
+	struct address_space *b_assoc_map;	/* mapping this buffer is
+						   associated with */
+	atomic_t b_count;//缓冲区使用计数，使用缓冲区头前，增加引用计数，使用之后，减少引用计数		/* users using this buffer_head */
+};
+
+//其中b_state标志是：
+enum bh_state_bits {
+	BH_Uptodate,	/* Contains valid data */
+	BH_Dirty,	/* Is dirty */
+	BH_Lock,	/* Is locked *///正被IO操作使用，被锁以防止被并发访问
+	BH_Req,		/* Has been submitted for I/O */
+	BH_Uptodate_Lock,/* Used by the first bh in a page, to serialise
+			  * IO completion of other buffers in the page
+			  */
+
+	BH_Mapped,	/* Has a disk mapping */
+	BH_New,		/* Disk mapping was newly created by get_block */
+	BH_Async_Read,	/* Is under end_buffer_async_read I/O */
+	BH_Async_Write,	/* Is under end_buffer_async_write I/O */
+	BH_Delay,	/* Buffer is not yet allocated on disk */
+	BH_Boundary,	/* Block is followed by a discontiguity */
+	BH_Write_EIO,	/* I/O error on write */
+	BH_Unwritten,	/* Buffer is allocated on disk but not written */
+	BH_Quiet,	/* Buffer Error Prinks to be quiet */
+
+	BH_PrivateStart,/* not a state bit, but the first bit available
+			 * for private allocation by other entities
+			 */
+};
+//缓冲区头的目的是描述磁盘块和内存缓冲区（特定页面的字节序列)的映射关系。
+//缓冲区头的两大弊端，缓冲区头是很大且不容易控制的数据结构体，后面IO操作都是通过内核直接对页面/地址空间进行操作。
+//仅能描述单个缓冲区，内核对大块数据的IO操作分解为对多个buffer_head结构体进行操作，复杂耗时。引出bio结构体
+```
+## bio结构体
+目前内核中的块IO操作的基本容器用bio结构体表示。现场的活动以片段链表方式来组织块IO操作，用片段来描述缓冲区。
+![image-20240103151415616](linux内核设计与实现.assets/image-20240103151415616.png)
+以上是bio结构体的变量和页结构的关系。
+- bio_io_vec结构体数组描述了一个缓冲区的所有片段，一个片段用一个bio_vec表示，总的有bi_vcnt个片段。一个片段用<page,offset,len>表示。**bi_idx则是不断更新**，指向当前的片段。bi_cnt记录bio结构体的使用计数，计数为0，需要撤销该结构体，释放内存。
+- 缓冲区头和新bio结构体的显著差别。bio结构体代表的是IO操作，可以是内存的一个或多个页面；而缓冲区头关联的是一个块，单独页的单独磁盘块。bio结构轻量，描述的块可以不用连续存储区。
+bio结构体代替buffer_head.bio处理高端内存容易，便于执行分散集中的块IO操作，轻量级的结构体，只需要包含块IO操作的所需信息就行。
+缓冲区头的作用是做磁盘块到页面的映射，bio结构体不包含任何和缓冲区相关的状态信息。
+## 请求队列
+块设备将他们挂起的块IO请求保存在请求队列中，该队列由reques_queue结构体表示。队列中的请求使用request表示，每个请求可能要操作多个连续的磁盘块，每个请求可由多个bio结构体构成。
+## IO调度程序
+磁盘寻址非常慢，所以内核不会简单的直接提交IO请求。==而是在提交前执行IO合并与排序的预操作==。内核中负责提交IO请求的子系统称为IO调度程序。
+IO调度程序合并并排序请求队列中挂起的请求。
+### IO调度程序的工作
+IO调度程序工作是管理块设备的请求队列，决定对立中的请求排列顺序以及在什么时候发请求到块设备。
+合并即：合并多个相邻磁盘块的访问为一次IO请求，减少寻址次数。
+排序即。将请求·队列的IO请求按扇区增长的方向进行排列，保证磁盘头直线运动。
+### Linus电梯
+合并IO请求，例如对文件的访问，在当前访问前合并还是访问的地方后合并，即向前合并和向后合并。合并尝试失败，找可能的插入点，找到就插入，负责插入队列尾。总之，如下图
+![image-20240103160759573](linux内核设计与实现.assets/image-20240103160759573.png)
+### 最终期限IO调度程序
+写操作可以异步完成，但是对应用程序来说读操作却只能同步完成。所以如果IO请求发生饥饿，很可能陷入写请求-饥饿-读请求的耗时循环中。所以最终期限IO调度程序引入来减少请求饥饿现象。
+通常减少请求饥饿需要用降低全局吞吐量为代价（特殊策略处理饥饿请求，和已有调度策略可能冲突）。所以平衡两者的是较困难的。
+![image-20240103163822248](linux内核设计与实现.assets/image-20240103163822248.png)
+如上设置了读请求/写请求/排序队列三个队列。通常读请求（500ms)，写请求是（5s）。即比linus电梯调度多了两个读请求队列和写请求队列。这两个FIFO队列的请求到计时计数还未被提交，就提交到派发队列中，提交该IO请求。
+### 预测IO调度程序
+降低全局吞吐量，对读请求的响应时间降低系统吞吐量。如，执行写操作时，读请求来了，则先执行读操作的寻址，后面再继续寻址写操作的地址继续操作，有两次寻址，耗时。所以预测IO调度程序诞生了。
+预测IO调度程序只是加上了预测启发的能力。
+即在提交IO请求后，有意的等待几ms。这几ms可等待提交读请求（任何相邻位置的请求都会立即得到处理），等待时间结束，再返回到原来的位置，继续执行以前剩下的请求。
+没有IO请求再等待期到来，可能会给系统性能带来轻微的损失。
+预测IO调度程序跟踪记录，统计每个应用程序块IO操作的习惯行为。如果预测准确率高，那么在等待期间有足量的IO请求到来，可以大大减少服务读请求所需要的寻址开销。既减小读响应的时间，又提高了吞吐量。
+### 完全公正的排队IO调度程序（CFQ）
+CFQ的IO调度程序是为每一个进程创建一个自己的请求队列。按时间片轮转方式轮转调度队列，达到进程级的公平。
+### 空操作的IO调度程序
+空操作IO调度程序只进行请求合并，不进行排序，维护请求队列以接近FIFO的形式排列。其专门为没有“寻道负担”，的随机访问设备如闪存设计。
+## 小结
+前面所述的四种调度程序，都可以使用内核命令行选项来指定的选定启用哪个IO调度程序来覆盖完全公平调度程序。
+# 第15章 进程地址空间（《程序员的自我修养》类似，简单看看）
+- mm_struct是内存描述结构体表示进程的地址空间。
+mmap和mm_rb描述的对象是相同的：该地址空间的全部内存区域。但是前者是以来链表形式（简单，高效遍历）存放后者是红黑树（快速查找）。
+所有mm_struct通过mm_list链表连接。访问该链表需要使用mmlist_lock锁。
+- 进程描述符的mm域存放内存描述符，即current->mm.在创建子进程时，有clone标志，就直接使用父进程的进程描述符；否则调用allocate_mm()函数进行内存描述符分配。
+- 内存描述符mm_struct撤销后归还到mm_cachep slab缓存中。
+- 内核线程没有进程地址空间，即虚拟内存（但是会用到一些必要信息吗，如页表（映射虚拟内存地址页到物理页框）等）；所以内核线程会使用上一个用户进程的内存描述符的信息，将其地址空间更新到内核进程描述符的activate_mm域。
+- vm_area_struct用来标识一个VMA，记录虚拟内存区间，访问控制权限，mm_struct等信息.
+vma标志vm_flags域内，反应内核处理页面所需要遵守的行为准则（包含内存区域每个页面信息）。
+设置vm_flags可以实现页面的不同权限控制。vm_read,vm_write,vm_exec等
+vma_area_struct（==虚拟内存不同的端对应不同的vma_area_struct==）的vm_ops执行操作函数表，操作函数表对指定的内存区域进行操作或者对页面标志进行修改等。
+链表用在遍历全部节点的时候（mmap），红黑树用在地址空间中定位特定的内存区域的时候（mm_rb）。
+- ==实际使用时的内存区域==，共享且不可写的vm_area_struct存在，是共享库在物理内存只有一份拷贝的实现基本（这也是共享库大量节约内存的关键）。对于共享但可写区域，则每个进程需要保留自己的一份映射。
+- 操作内存区域，
+find_vma()找到一个给定的内存地址在地址空间的哪个area（内存区域area，我这里理解为段，这个搜索是，先找缓存的vma区域有没有，再搜索前面说的mm_rb的红黑树结构）。
+find_vma_prev(),返回第一个小于addr的vma。
+find_vma_intersection()，返回一个和指定地址区间相交的vma。
+- 创建地址区间（分配超过128KB的内存），do_mmap()创建新的线性地址空间，如果和已有vma相邻进行合并。mmap()函数的file有参数则建立文件映射，否则就是匿名映射，创建了匿名空间，用作堆的内存分配。注意加入红黑树和内存区域链表中。
+- mummap()和do_mum
 
