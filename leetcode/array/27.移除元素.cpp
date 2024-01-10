@@ -9,7 +9,10 @@ class Solution {
 public:
     int removeElement(vector<int>& nums, int val) {
         int size = 0;
-        int ksize = nums.size()-1;
+        int ksize = nums.size() - 1;
+        if (ksize < 0){
+            return 0;
+        }
         // for (int i = 0;i < ksize;++i) {
         //     if(val == nums[i]){
         //         nums.erase(nums.begin()+i);
@@ -17,26 +20,24 @@ public:
         //     }
         //     size++;
         // }
-        while (size <= ksize) {
+        while (size < ksize) {
             if (val != nums[size] && nums[ksize] == val) {
                 size++;
                 ksize--;
-            } else if(val == nums[size] && nums[ksize] == val) {
+            } else if (val == nums[size] && nums[ksize] == val) {
                 ksize--;
-            } else if (val !=nums[size] && nums[kszie] != val) {
+            } else if (val != nums[size] && nums[ksize] != val) {
                 size++;
             } else {
                 int temp = nums[size];
-                nums[size] = nums[kszie];
+                nums[size] = nums[ksize];
                 nums[ksize] = temp;
-                kszie--;
+                ksize--;
                 size++;
             }
         }
-        if (nums[size] != val)
+        if (nums[size] == val)
             size -= 1;
-        return size+1;
+        return size + 1;
     }
 };
-// @lc code=end
-
