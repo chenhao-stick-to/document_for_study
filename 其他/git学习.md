@@ -4,7 +4,7 @@
 （3）ssh-add ~/.ssh/id_ed25519 替换id_ed25519为指定目录的密钥。
 （4）做完这些如果还是不能连接，仔细思考本机是不是有多个密钥文件，此时可以修改config文件，增加对应网站的本机密钥地址。例如:
 ![image-20230914094602791](git学习.assets/image-20230914094602791.png)
-其他：ssh -T github.com 查看是否能连接上
+其他：给i他 查看是否能连接上
 
 **解决git clone时的 fatal: unable to access 'https://github.com/apache/tvm.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.问题：**
 
