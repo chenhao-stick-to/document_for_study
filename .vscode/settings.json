@@ -1,6 +1,13 @@
 {
     "files.associations": {
         "unistd.h": "c",
-        "cstdint": "cpp"
+        "cstdint": "cpp",
+        "array": "cpp",
+        "initializer_list": "cpp",
+        "utility": "cpp",
+        "*.tcc": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp"
     }
 }
