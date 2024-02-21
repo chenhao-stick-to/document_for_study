@@ -41,7 +41,7 @@ https://www.jianshu.com/p/c2ec5f06cf1a
 首先将git在本地的working tree分为三个区：工作目录区（实际的代码区），index暂存区（实际的add之后的暂存区），repository区（实际的commit之后的区）。
 
 git reset --hard <具体的commit编号/HEAD也可>，是将工作目录，暂存区以及repository区的所有内容都更改为和指定的Head一样。
-
+给i他
 git reset --soft <具体的commit编号/HEAD也可>，保留工作目录，将重置HEAD所带的差异放进暂存区，只有repository区和HEAD保持一致，工作目录保持不变，
 
 git reset --mixed <具体的commit编号/HEAD也>,清空暂存区，将工作目录的修改以及暂存区的内容和reset导致的新的文件差异到更新到工作目录。
