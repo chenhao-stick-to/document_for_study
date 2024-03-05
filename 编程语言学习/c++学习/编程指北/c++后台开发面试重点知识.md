@@ -233,5 +233,149 @@ int main() {
 }
 ```
 ## extern C的作用
-各个编译器对函数的修饰方法不同，使用extern "C"关键字，可将C++编译器的命名规则转换为C语言的命名规则，使C++代码可调用C语言的函数/变量。
+各个编译器对函数的修饰方法不同，使用extern "C"关键字，可将C++编译器的命名规则转换为C语言的命名规则，使C代码可调用C++语言编写的函数/变量（使用extern "C"修饰）。
+extern "C"对函数的参数类型和返回值类型无影响，**使用extern "C"声明函数，需要保证函数的参数类型和返回值类型和C语言定义一样。C语言不支持class，模板等参数类型，需自行确定。**
+## mutable 作用
+mutable是C++中的一个关键字，用于修饰类的成员变量，表示该成员变量即使在一个const成员函数中也可以被修改。（==有点奇怪==。
+==如果需要在const函数里面修改一些跟类状态无关的数据成员，那么这个函数就应该被mutable来修饰==，并且放在函数后后面关键字位置。如下：
+```c
+#include <iostream>
+
+class Counter {
+public:
+    Counter() : count(0), cache_valid(false), cached_value(0) {}
+
+    int get_count() const {//声明为const，不能修改成员变量；但用mutable修饰，故可以修改
+        if (!cache_valid) {
+            // 模拟一个耗时的计算过程
+            cached_value = count * 2;
+            cache_valid = true;
+        }
+
+        return cached_value;
+    }
+
+    void increment() {
+        count++;
+        cache_valid = false; // 使缓存无效，因为count已经更改
+    }
+
+private:
+    int count;
+    mutable bool cache_valid; // 缓存是否有效的标志
+    mutable int cached_value; // 缓存的值
+};
+
+int main() {
+    Counter counter;
+    counter.increment();
+    counter.increment();
+
+    std::cout << "Count: " << counter.get_count() << std::endl; // 输出 4
+
+    return 0;
+}
+```
+## C++的几种类型转换
+static_cast,dynamic_cast,const_cast,reinterpret_cast。
+- static_cast,和c语言的（）强制转换基本等价
+1）基本类型转换（int，short，long，float，double等互相转换）
+2）指针类型转换，在类层次结构中，尤其是将基类指针转换为派生类指针，转换不执行运行时类型检查(dynamic_cast会进行)，可能不安全。
+==C++的类型检查，C++的数据类型大部分是在编译时就确定了的，这是就可以进行编译时类型检查；但是由于C++的多态机制（基于虚函数实现），所以会出现运行时确定调用函数，即再确定数据类型的情况，这就是运行时类型检查。（基类指针可以指向任意的派生类的对象，如何知道实际指向的派生类类型，可以运用C++的RTTI机制（typeid和dynamic_cast操作符）将基类指针安全的转换为派生类类型的指针或者引用）==。
+3）引用类型的转换
+```c++
+Derived derived_obj;
+Base& base_ref = derived_obj;
+Derived& derived_ref = static_cast<Derived&>(base_ref); // 将基类引用base_ref转换为派生类引用derived_ref
+```
+- dynamic_cast
+dynamic_cast在C++中主要应用于父子类层次结构中的安全类型转换,可在运行时指向类型检查，对比static_cast更安全。
+1）向下类型转换，基类指针或引用转换为派生类指针或引用时，dynamic_cast可以确保类型兼容性，转换失败，dynamic_cast返回空指针（指针类型）/抛出异常（引用类型）
+```c++
+class Base { virtual void dummy() {} };
+class Derived : public Base { int a; };
+
+Base* base_ptr = new Derived();
+Derived* derived_ptr = dynamic_cast<Derived*>(base_ptr); // 将基类指针base_ptr转换为派生
+```
+2) dynamic_cast底层原理
+```c++
+class Animal { public: virtual ~Animal() {} };
+class Dog : public Animal { public: void bark() { /* ... */ } };
+class Cat : public Animal { public: void meow() { /* ... */ } };
+
+Animal* animal_ptr = /* ... */;
+
+// 尝试将Animal指针转换为Dog指针
+Dog* dog_ptr = dynamic_cast<Dog*>(animal_ptr);//不是该子类，则返回空指针
+if (dog_ptr) {
+    dog_ptr->bark();
+}
+
+// 尝试将Animal指针转换为Cat指针
+Cat* cat_ptr = dynamic_cast<Cat*>(animal_ptr);
+if (cat_ptr) {
+    cat_ptr->meow();
+}
+/*
+dynamic_cast有效,基类至少有一个虚函数，dynamic_cast只有在基类存在虚函数(虚函数表)的情况下才有可能将基类指针转化为子类
+*/
+```
+3）dynamic_cast 底层原理
+其依赖于运行时类型信息（RTTI, Runtime Type Information），包含类的类型信息和类层次结构。
+使用虚函数时，该类会生成一个虚函数表，虚函数表有RTTI的信息，以及各虚函数的地址。
+```c
+class Point
+{
+public:
+	Point(float xval);
+	virtual ~Point();
+ 
+	float x() const;
+	static int PointCount();
+ 
+protected:
+	virtual ostream& print(ostream& os) const;
+ 
+	float _x;
+	static int _point_count;
+};
+```
+下面是该类对应的对象模型：
+![image-20240305233109207](c++后台开发面试重点知识/image-20240305233109207.png)
+每个对象都有一个vptr指向虚函数表，从而可以获取该类的RTTI的信息。
+下面是dynamic_cast的工作原理：
+- 首先，dynamic_cast通过查询对象的 vptr 来获取其RTTI（这也是为什么 dynamic_cast 要求对象有虚函数）
+- 然后，dynamic_cast比较请求的目标类型与从RTTI获得的实际类型。如果目标类型是实际类型或其基类，则转换成功。
+- 如果目标类型是派生类，dynamic_cast会检查类层次结构，以确定转换是否合法。如果在类层次结构中找到了目标类型，则转换成功；否则，转换失败。
+- 当转换成功时，dynamic_cast返回转换后的指针或引用。
+- 如果转换失败，对于指针类型，dynamic_cast返回空指针；对于引用类型，它会抛出一个std::bad_cast异常。
+dynamic_cast是运行时动态类型检查，性能比static在编译器转换时要慢。
+3）const_cast
+- 修改const对象,有尝试过，在const关键字有讲到。
+- const对象调用非const成员函数
+```c++
+class MyClass {
+public:
+    void non_const_function() { /* ... */ }
+};
+
+const MyClass my_const_obj;
+MyClass* mutable_obj_ptr = const_cast<MyClass*>(&my_const_obj); // 删除const属性，使得可以调用非const成员函数
+mutable_obj_ptr->non_const_function(); // 调用非const成员函数
+//用于const的常量对象的const去除，来调用对应类的非常量函数。
+//！行为不是很安全，请自己谨慎操作
+```
+- reinterpret_cast
+用法 reinterpret_cast <new_type> (expression)，用于在不同类型之间进行低级别的转换，不进行类型的检查，仅仅是重新解释底层比特（也就是对指针所指针的那片比特位换个类型做解释）。可能导致==未定义的行为==。
+```c++
+int a = 42;
+int* int_ptr = &a;
+char* char_ptr = reinterpret_cast<char*>(int_ptr); // 将int指针转换为char指针
+//如图像数据的转换为char*字符流进行保存！
+```
+对reinterpret_cast的详细解释 [reinterpret_cast解释](https://zhuanlan.zhihu.com/p/33040213)
+
+
+
 
