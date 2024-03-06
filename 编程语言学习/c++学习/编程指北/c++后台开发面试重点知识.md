@@ -650,4 +650,160 @@ int main() {
 ## C++多态的实现方式
 C++实现多态的方法主要包括虚函数、纯虚函数和模板函数；**虚函数、纯虚函数实现的多态叫动态多态（运行时），模板函数、重载等实现的叫静态多态(编译期)。**
 - 虚函数、纯虚函数实现多态
+C++多态必须满足的条件，必须通过基类的指针或者引用调用虚函数；被调用的函数是虚函数，且必须完成对基类虚函数的重写。
+**虚函数用于实现类的多态功能；但是纯虚函数一般用于实现一个抽象基类，限制派生类必须实现某一种行为函数！**
+```c++
+//派生类中继承的基类的数据成员一定是交给基类进行初始化，无论显式调用基类的构造函数，还是执行默认构造函数。所以基类成员变量不能在初始化列表中进行初始化，但可以在函数内部进行赋值。
+#include <iostream>
+using namespace std;
+class Shape {
+    public:
+    Shape(){
+        width =100;
+    height =10;
+    }
+    //  Shape(int a,int b):width(a),height(b){
+    //     cout<<"constrructor!";
+    //  }
+      virtual int area() = 0;
+      int width;
+      int height;
+    
+};
 
+class Rectangle: public Shape {
+   public:
+        Rectangle(int wide,int he){
+        //     width = wide;
+        //    height = he;
+        }
+      int area () { 
+         cout << "Rectangle class area :"; 
+         return (width * height); 
+      }
+};
+
+class Triangle: public Shape{
+   public:
+  Triangle(int wide,int he){
+           this->width = wide;
+           this->height = he;
+        }
+      int area () { 
+         cout << "Triangle class area :"; 
+         return (width * height / 2); 
+      }
+};
+
+int main() {
+    Shape *shape;
+    Rectangle rec(10,7);
+    Triangle  tri(10,5);
+
+    shape = &rec;
+    cout<<shape->area();
+    cout<<endl;
+    shape = &tri;
+    cout<<shape->area();
+
+   return 0;
+}
+//对于初始化列表，一般有下面三种情况，可在初始化列表中进行初始化！
+// 初始化非静态的数据成员：非静态的数据成员可以在初始化列表中初始化。如果你没有在初始化列表中初始化它们，那么它们将使用默认的构造函数进行初始化。
+// 初始化基类：如果你的类从一个或者多个基类继承，你可以在初始化列表中调用基类的构造函数以初始化基类的部分。
+// ！！！初始化const和引用类型的成员：const数据成员和引用必须在构造过程中初始化，因此你需要在初始化列表中为它们提供初始化值
+//为啥尽量在初始化列表中进行初始化，其本质是因为类的成员初始化其实是在初始化列表中完成的，而构造函数花括号里面的其实全部是在进行赋值。所以在初始化列表可以省略一个拷贝赋值的时间！
+//至于静态成员变量，岂不是属于类的对象的，是属于类的，所以这个值需要在类外进行初始化！
+```
+- 模板函数多态
+```c++
+template <class T>
+T GetMax (T a, T b) {
+   return (a>b?a:b);
+}
+
+int main () {
+   int i=5, j=6, k;
+   long l=10, m=5, n;
+   k=GetMax<int>(i,j);
+   n=GetMax<long>(l,m);
+   cout << k << endl;
+   cout << n << endl;
+   return 0;
+}
+//模板函数可以根据传递参数的不同类型，自动生成相应类型的函数代码。模板函数可以用来实现多态。
+```
+## this 指针
+- this指针：指向当前对象的指针，常量成员函数中，this指针类型为指向常量对象的常量指针，不能用于修改成员变量的值！
+- static 函数不能访问成员变量，static函数为静态成员函数，与类而不是类的对象相关！==静态函数没有this指针，所以不能访问任何非静态成员变量，静态成员函数不能有任何非静态成员变量，否则会进行报错！==
+总结：this 实际上是成员函数的一个形参，在调用成员函数时将对象的地址作为实参传递给 this。this是一个隐式的形参，本质上是成员函数的局部变量，对象调用成员函数才进行赋值。==成员函数最终被编译成与对象无关的普通函数，除了成员变量，会丢失所有信息，所以编译时要在成员函数中添加一个额外的参数，把当前对象的首地址传入，以此来关联成员函数和成员变量。==
+## 虚函数表
+### c++对象模型
+指向了对 C++的内存模型虚函数表部分的理解。
+==C++ 是如何存储一个对象的数据（成员函数、成员变量、静态变量、虚函数等等）==
+一般来说通过父类指针来访问子类中没有覆盖父类的成员函数是非法的，但是可以通过获取虚函数表，基于偏移的形式来进行调用！
+```c++
+#include <iostream>
+
+// 函数指针
+typedef void(*Func)(void);
+
+class MyBaseClass {
+public:
+    virtual void virtualMethod1() {
+        std::cout << "BaseClass::virtualMethod1()" << std::endl;
+    }
+    virtual void virtualMethod2() {
+        std::cout << "BaseClass::virtualMethod2()" << std::endl;
+    }
+    virtual void virtualMethod3() {
+        std::cout << "BaseClass::virtualMethod3()" << std::endl;
+    }
+
+};
+
+class MyDerivedClass : public MyBaseClass {
+public:
+    virtual void virtualMethod3() {
+        std::cout << "DerivedClass::virtualMethod3()" << std::endl;
+    }
+    virtual void virtualMethod4() {
+        std::cout << "DerivedClass::virtualMethod4()" << std::endl;
+    }
+    virtual void virtualMethod5() {
+        std::cout << "DerivedClass::virtualMethod5()" << std::endl;
+    }
+};
+
+void PrintVtable(void** vtable) {
+    // 输出虚函数表中每个函数的地址
+    for (int i = 0; vtable[i] != nullptr; i++) {
+        // 最多调用五个函数，怕访问到虚函数表非法的地址，因为就五个函数
+        if (i >= 5)  {
+            return;
+        }
+        std::cout << "Function " << i << ": " << vtable[i] << std::endl;
+        // 将虚函数表中的虚函数转换为函数指针，然后进行调用
+        Func func = (Func) vtable[i];
+        func();
+    }
+}
+
+int main() {
+    MyDerivedClass obj;
+
+    // 取对象的首地址，然后转换为的指针，就取到了虚函数表指针，指向 obj 对象的虚函数表
+    // 因为大多数实现上，虚函数表指针一般都放在对象第一个位置
+    void** vtable = *(void***)(&obj);
+    std::cout << "DerivedClass Vetable:" << std::endl;
+    // 打印子类的虚函数表
+    PrintVtable(vtable);
+
+    std::cout << std::endl <<  "BaseClass Vetable:" << std::endl;
+    MyBaseClass base_obj;
+    void** vbtable = *(void***)(&base_obj);
+    // 打印父类的虚函数表
+    PrintVtable(vbtable);
+    return 0;
+}
+```
