@@ -376,6 +376,278 @@ char* char_ptr = reinterpret_cast<char*>(int_ptr); // 将int指针转换为char�
 ```
 对reinterpret_cast的详细解释 [reinterpret_cast解释](https://zhuanlan.zhihu.com/p/33040213)
 
+# C++面向对象
+## 面向对象三大特性，封装，继承，多态
+- 封装，将数据（属性）和操作这些数据的函数（方法）组合再一个类中的过程。封装的目的是隐藏类的内部实现细节，仅暴露外部必要接口。控制类成员的访问级别。
+- 继承，继承允许我们创建具有共享代码的类层次结构，访问修饰符（如 public、protected、private）控制了派生类对基类成员的访问权限。
+- 多态，在 C++ 中，多态主要通过虚函数（Virtual Function）和抽象基类（Abstract Base Class）来实现。虚函数允许在派生类中重写基类的方法，而抽象基类包含至少一个纯虚函数（Pure Virtual Function），不能被实例化，只能作为其他派生类的基类。==派生类也必须有这个抽象基类的全部纯虚函数的实现，这样它才不是抽象类，可以有实例对象==
+## c++类成员访问权限
+public，protected，private三种继承，派生类都不能直接访问基类的私有成员。只能访问公有和保护成员，但是这两个成员在派生很类的访问权限和继承方式相关，小于这个权限就变成这个权限，大于则保持不变。（权限：public < protected < private）              
+## 重载、重写、隐藏的区别       
+- 重载，相同作用域（命名空间，同一个类）拥有相同的方法名。特点：
+方法具有相同的名称。方法具有不同的参数类型或参数数量。返回类型可以相同或不同。同一作用域，比如都是一个类的成员函数，或者都是全局函数。
+- 重写，用在派生类重新定义基类的方法。条件有：方法具有相同的名称。方法具有相同的参数类型和数量。方法具有相同的返回类型。重写的基类中被重写的函数必须有virtual修饰。重写主要在继承关系的类之间发生。
+- 隐藏，隐藏是指派生类的函数屏蔽了与其同名的基类函数。注意只要同名函数，不管参数列表是否相同，基类函数都会被隐藏。
+```c++
+#include<iostream>
+using namespace std;
 
+classA{
+public:
+  void fun1(int i, int j){
+    cout <<"A::fun1() : " << i <<" " << j << endl;
+  }
+};
+classB : public A{
+public:
+  //隐藏
+  void fun1(double i){
+    cout <<"B::fun1() : " << i << endl;
+  }
+};
+int main(){
+  B b;
+  b.fun1(5);//调用B类中的函数
+  b.fun1(1, 2);//出错，因为基类函数被隐藏
+  system("pause");
+  return 0;
+}
+```
+- **区别**
+1）重载和重写：重写不同类，重载相同作用域。重写参数列表一定相同，重载参数列表一定不同。重写，基类一定有virtual修饰，重载则可有可没有。
+2）隐藏，重写，重载区别。隐藏函数和被隐藏函数参数列表可以相同，也可以不同，但函数名一定同；当参数不同时，无论基类中的函数是否被virtual修饰，基类函数都是被隐藏，而不是被重写
+## C++ 类对象的初始化和析构顺序
+- 基类初始化顺序，**如果当前类继承自一个或多个基类，它们将按照==声明顺序进行初始化==，但是在有虚继承和一般继承存在的情况下，优先虚继承**。
+- 成员变量初始化顺序，类成员变量按在类定义的声明顺序进行初始化！有基类的初始化则先初始化基类。
+- 执行构造函数，如下：
+```c++
+#include <iostream>
 
+class Base {
+public:
+    Base() { std::cout << "Base constructor" << std::endl; }
+    ~Base() {
+        std::cout << "Base destructor" << std::endl;
+    }
+};
+
+class Base1 {
+public:
+    Base1() { std::cout << "Base1 constructor" << std::endl; }
+    ~Base1() {
+        std::cout << "Base1 destructor" << std::endl;
+    }
+};
+
+class Base2 {
+public:
+    Base2() { std::cout << "Base2 constructor" << std::endl; }
+    ~Base2() {
+        std::cout << "Base2 destructor" << std::endl;
+    }
+};
+
+class Base3 {
+public:
+    Base3() { std::cout << "Base3 constructor" << std::endl; }
+    ~Base3() {
+        std::cout << "Base3 destructor" << std::endl;
+    }
+};
+
+class MyClass : public virtual Base3, public Base1, public virtual Base2 {//声明顺序
+public:
+    MyClass() : num1(1), num2(2) {
+        std::cout << "MyClass constructor" << std::endl;
+    }
+    ~MyClass() {
+        std::cout << "MyClass destructor" << std::endl;
+    }
+
+private:
+    int num1;
+    int num2;
+    // 这个是为了看成员变量的初始化顺序
+    Base base;
+};
+
+int main() {
+    MyClass obj;
+    return 0;
+}
+//初始化列表的初始化顺序，总结就是一个派生类，按照继承的声明顺序排列，虚继承的类的初始化优先，然后再实际的父类初始化，最后再初始化本类的成员变量。
+```
+==**虚继承相关知识**==：
+每个虚继承的子类都有一个虚基类表指针（占用一个指针的存储空间，4字节）和虚基类表（不占用类对象的存储空间）。虚基类表指针（virtual base table pointer）指向虚基类表（virtual table），虚表中记录了虚基类与本类的偏移地址，通过偏移地址，就找到了虚基类成员。对比虚函数实现：
+它们有相似之处，都利用了虚指针（均占用类的存储空间）和虚表（均不占用类的存储空间）。
+虚基类依旧存在继承类中，占用存储空间；虚函数不占用存储空间。
+**虚基类表存储的是虚基类相对直接继承类的偏移；而虚函数表存储的是虚函数地址。**
+```c++
+class A    // 大小为 4  
+{  
+public:  
+    int a;  
+};  
+class B :virtual public A    // 大小为 12，变量 a, b 共 8 字节，虚基类表指针 4  
+{  
+public:  
+    int b;  
+};  
+class C :virtual public A   // 与 B 一样 12  
+{  
+public:  
+    int c;  
+};  
+class D :public B, public C    // **24, 变量 a, b, c, d 共 16，B 的虚基类指针 4，C 的虚基类指针 4**
+{  
+public:  
+    int d;  
+}; 
+//虚基类指针有继承关系，会包含类层次结构上，所有类的虚基类指针；但是虚函数指针，每个类只有一个。
+```
+## c++析构函数可以抛出异常吗？
+**effective c++ 别让异常逃离析构函数**：
+析构函数常常被自动调用，在析构函数中抛出的异常往往会难以捕获，引发程序非正常退出或未定义行为。
+析构函数是由C++来调用的，源代码中不包含对它的调用，因此它抛出的异常不可被捕获
+==对于栈中的对象而言，在它离开作用域时会被析构；对于堆中的对象而言，在它被delete时析构。==
+如果在析构函数**中真的可能存在异常，该如何处理呢**？
+```c++
+class DBConnection
+{ 
+public:
+　　 ...
+　　 static DBConnection create(); //返回DBConnection对象；为求简化暂略参数
+　　 void close(); //关闭联机；失败则抛出异常。
+};
+
+//如何保证客户不忘记在DBConnection对象上调用close(),创建管理DBConnection资源的class，在析构函数中调用close。即以对象管理资源RAII.
+//这个class用来管理DBConnection对象
+class DBConn
+{ 
+public:
+　　 ...
+　　DBConn(const DBConnection& db)
+　　{
+       this->db=db;
+   }
+　 ~DBConn() //确保数据库连接总是会被关闭
+　　{
+　　    db.close();
+　　}
+　　
+private:
+　　 DBConnection db;
+};
+```
+调用close成功，无任何问题，但如果调用产生异常，DBConn析构函数会传播该异常。离开析构函数会造成问题，如何解决？
+```c++
+//1)如果close抛出异常就结束程序，通常调用abort完成。防止异常导致程序后面的不明确行为。
+DBConn::~DBconn()
+{
+    try
+    {
+	    db.close(); 
+    }
+    catch(...)
+    {
+        abort();//终止程序
+    }
+}
+//2）吞下因调用 close 而发生的异常，理解为打日志，记录发生了什么事，前提事程序能可靠执行。
+DBConn::~DBConn
+{
+    try{ db.close();}
+    catch(...) 
+    {
+        //制作运转记录，记下对close的调用失败！
+    }
+}
+
+//3）重新设计 DBConn 接口，使客户有机会对出现的异常作出反应
+// 在DBConn中添加close函数，将责任转移到DBConn客户中。当存在一种操作失败必须抛出异常时，必须放在析构函数之外去解决这个异常。因为在析构函数吐出异常，会带来"过早结束程序/发生未定义行为危险"
+```
+析构函数可抛出异常，但不推荐！可能造成：
+- 资源泄露：当一个对象被析构时，析构函数负责释放该对象持有的资源。如果析构函数抛出异常，这个过程可能会中断，导致资源泄露。
+- 叠加异常：如果析构函数在处理另一个异常时抛出异常，会导致异常叠加。这种情况下，程序将无法处理两个异常，从而可能导致未定义行为或程序崩溃。
+为了避免这些问题，**通常建议在析构函数中处理异常或者避免执行会抛出异常的函数，可以在析构函数中使用 try-catch 块来捕获和处理潜在的异常**，确保资源得到正确释放和清理。 
+## c++中的深浅拷贝
+- 浅拷贝
+浅拷贝仅复制对象的基本类型成员和指针成员的值，不复制指针指向的内存。
+可能导致两个对象共享相同的资源，从而引发潜在的问题，如内存泄漏、意外修改共享资源等。
+编译器默认执行浅拷贝。POD型数据适合浅拷贝。
+- 深拷贝
+深拷贝不仅复制对象的基本类型成员和指针成员的值，还复制指针所指向的内存。因此，两个对象不会共享相同的资源，避免了潜在问题。==**深拷贝通常需要显式实现拷贝构造函数和赋值运算符重载。**==
+```c++
+#include <iostream>
+#include <cstring>
+using namespace std;
+class MyClass {
+public:
+    MyClass(const char* str) {
+        data = new char[strlen(str) + 1];
+        cout<<"default constructor!"<<endl;
+        strcpy(data, str);
+    }
+
+    // 深拷贝的拷贝构造函数
+    MyClass(const MyClass& other) {
+        data = new char[strlen(other.data) + 1];
+        strcpy(data, other.data);
+        cout<<"copy constructor!"<<endl;
+    }
+
+    // 深拷贝的赋值运算符重载
+    MyClass& operator=(const MyClass& other) {
+        if (this == &other) {
+            return *this;
+        }
+        
+        delete[] data;
+        data = new char[strlen(other.data) + 1];
+        strcpy(data, other.data);
+        cout<<"copy !"<<endl;
+        return *this;
+    }
+    
+   void SetString(const char* str) {
+     if (data != NULL) {
+       delete[] data;
+     }
+     data = new char[strlen(str) + 1];
+     strcpy(data, str);
+   }
+   
+    ~MyClass() {
+        delete[] data;
+    }
+
+    void print() {
+        std::cout << data << std::endl;
+    }
+
+private:
+    char* data;
+};
+
+int main() {
+    MyClass obj1("Hello, World!");
+    // MyClass obj2 ="Hello, World!";//复制省略，直接执行默认构造函数
+    MyClass obj2 = obj1; // 深拷贝，执行拷贝构造函数
+    MyClass obj3("Hello World!");
+    obj3 = obj1;//执行重载的拷贝函数。
+    obj1.print(); // 输出：Hello, World!
+    obj2.print(); // 输出：Hello, World!
+    obj3.print();
+    // 修改obj2中的数据，不会影响obj1
+    obj1.SetString("Test");
+    obj1.print(); // 输出：Hello, World!
+    obj2.print(); // 输出：Hello, World!
+    obj3.print();
+    return 0;
+}
+
+```
+## C++多态的实现方式
+C++实现多态的方法主要包括虚函数、纯虚函数和模板函数；**虚函数、纯虚函数实现的多态叫动态多态（运行时），模板函数、重载等实现的叫静态多态(编译期)。**
+- 虚函数、纯虚函数实现多态
 
