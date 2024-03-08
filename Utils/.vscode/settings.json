@@ -1,0 +1,61 @@
+{
+    // 值设置为true时，保存自动调整格式，vscode内置选项
+    "editor.formatOnSave": true,
+    // 第120列显示一条竖线，作为自动换行的标准
+    "editor.rulers": [
+        120
+    ],
+    // 定义一个优先于其他所有格式设置的默认格式
+    "[c]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    // Doxygen
+    // Doxygen注释触发序列及格式设置
+    "doxdocgen.c.commentPrefix": " * ",
+    "doxdocgen.c.firstLine": "/**",
+    "doxdocgen.c.lastLine": " */",
+    "doxdocgen.c.triggerSequence": "/**",
+    // 文件注释的组成及其排序
+    "doxdocgen.file.fileOrder": [
+        "file", // @file
+        "brief", // @brief 简介
+        "author", // 作者
+        "date", // 日期
+        "copyright", // 版权
+        "custom" // 自定义
+    ],
+    // 版权信息模板
+    "doxdocgen.file.copyrightTag": [
+        "@copyright ndsl"
+    ],
+    // 自定义模块，此处为修改日志
+    "doxdocgen.file.customTag": [
+        "---------------------------------------------------------------------------",
+        " Change History :                                                         ",
+        "---------------------------------------------------------------------------",
+        "   <Date>   | <Version> |    <Author>   |    <Description>                ",
+        "---------------------------------------------------------------------------",
+        " {date} |   2.0.0   |     {author}    |     modify the version               ",
+        "---------------------------------------------------------------------------",
+    ],
+    // 上述标签tag的具体信息格式模板
+    "doxdocgen.file.fileTemplate": "@file   {name}",
+    "doxdocgen.generic.authorEmail": "443248173@qq.com",
+    "doxdocgen.generic.authorName": "wangxu",
+    "doxdocgen.generic.authorTag": "@author {author} ({email})",
+    "doxdocgen.generic.dateFormat": "2023/08/23",
+    "doxdocgen.generic.dateTemplate": "@date   {date}",
+    // 函数注释序列（主要体现在函数注释上）
+    "doxdocgen.generic.order": [
+        "brief",
+        "param",
+        "return"
+    ],
+    // 上述标签tag的格式模板
+    "doxdocgen.generic.briefTemplate": "@brief ",
+    "doxdocgen.generic.paramTemplate": "@param  {param} ",
+    "doxdocgen.generic.returnTemplate": "@return ",
+}

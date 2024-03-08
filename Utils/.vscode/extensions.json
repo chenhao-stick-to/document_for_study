@@ -1,0 +1,35 @@
+{
+	// See https://go.microsoft.com/fwlink/?LinkId=827846 to learn about workspace recommendations.
+	// Extension identifier format: ${publisher}.${name}. Example: vscode.csharp
+
+	// List of extensions which should be recommended for users of this workspace.
+	"recommendations": [
+		// c++ extension pack
+		"ms-vscode.cpptools-extension-pack",
+
+		// Cmake
+		"twxs.cmake",
+		"ms-vscode.cmake-tools",
+
+		// Clang-format
+		"xaver.clang-format",
+
+		// 文件图标
+		"vscode-icons-team.vscode-icons",
+		
+		// Gitlens
+		"eamodio.gitlens",
+		// 若gitlens无法使用，则用下面git-graph代替
+		"mhutchie.git-graph",
+
+		// Doxygen Documentation Generator
+		"cschlosser.doxdocgen",
+
+		// Todo Tree
+		"gruntfuggly.todo-tree",
+	],
+	// List of extensions recommended by VS Code that should not be recommended for users of this workspace.
+	"unwantedRecommendations": [
+		
+	]
+}
