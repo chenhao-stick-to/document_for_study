@@ -1070,3 +1070,280 @@ int main(){
 //如上是c++版的一个处理，上面是直接将change_string函数栈的temp变量地址修改，所以这导致了temp变量存储的不再是main函数d对应的"haochen"常量对应的地址。自然无法修改。
 ```
 ## C++ RAII思想
+### 什么是RAII
+资源获取即初始化（Resource Acquisition Is Initialization，简称 RAII）是一种 C++ 编程技术，它将在使用前获取（分配的堆内存、执行线程、打开的套接字、打开的文件、锁定的互斥量、磁盘空间、数据库连接等有限资源）的资源的生命周期与某个对象的生命周期绑定在一起。
+确保在控制对象的生命周期结束时，按照资源获取的相反顺序释放所有资源.资源获取失败（构造函数退出并带有异常），则按照初始化的相反顺序释放所有已完全构造的成员和基类子对象所获取的资源。
+### RAII原理
+核心思想：**利用栈上局部变量的自动析构来保证资源一定会被释放。**
+变量的析构函数调用由编译器保证执行，资源获取和释放和对象构造/析构绑定在一起。
+### RAII的实现步骤
+- 设计一个类封装资源，资源可以是内存、文件、socket、锁等等一切
+- 在构造函数中执行资源的初始化，比如申请内存、打开文件、申请锁
+- 在析构函数中执行销毁操作，比如释放内存、关闭文件、释放锁
+- 使用时声明一个该对象的类，一般在你希望的作用域声明即可，比如在函数开始，或者作为类的成员变量
+```c++
+//不使用RAII思想
+#include <iostream>
+#include <fstream>
+
+int main() {
+    std::ifstream myfile("example.txt"); // 换自己的文件路径
+    if (myfile.is_open()) {
+        std::cout << "File is opened." << std::endl;
+        // do some work with the file
+    }
+    else {
+        std::cout << "Failed to open the file." << std::endl;
+    }
+    myfile.close();//需自己手动释放申请资源
+    return 0;
+}
+
+
+//使用RAII思想
+#include <iostream>
+#include <fstream>
+
+class File {
+public:
+    File(const char* filename) : m_handle(std::ifstream(filename)) {}
+    ~File() {
+        if (m_handle.is_open()) {
+            std::cout << "File is closed." << std::endl;
+            m_handle.close();//析构函数自动释放，无需手动释放，避免程序提前崩溃，导致该资源没有被释放，造成内存泄漏。
+        }
+    }
+
+    std::ifstream& getHandle() {
+        return m_handle;
+    }
+
+private:
+    std::ifstream m_handle;//作为类的成员
+};
+
+int main() {
+    File myfile("example.txt");
+    if (myfile.getHandle().is_open()) {
+        std::cout << "File is opened." << std::endl;
+        // do some work with the file
+    }
+    else {
+        std::cout << "Failed to open the file." << std::endl;
+    }
+    return 0;
+}
+```
+### 用 RAII 思想包装 mutex
+C++ 中，可以使用 RAII 思想来包装 mutex，确保在多线程编程中始终能安全锁定和解锁互斥量，这个用得非常多。
+```c++
+#include <iostream>
+#include <mutex>
+#include <thread>
+
+class LockGuard {
+public:
+    explicit LockGuard(std::mutex &mtx) : mutex_(mtx) {
+        mutex_.lock();
+    }
+
+    ~LockGuard() {
+        mutex_.unlock();
+    }
+
+    // 禁止复制
+    LockGuard(const LockGuard &) = delete;
+    LockGuard &operator=(const LockGuard &) = delete;
+
+private:
+    std::mutex &mutex_;
+};
+
+// 互斥量
+std::mutex mtx;
+// 多线程操作的变量
+int shared_data = 0;
+
+void increment() {
+    for (int i = 0; i < 10000; ++i) {
+        // 申请锁
+        LockGuard lock(mtx);//在这里申请锁，有其他锁则等待，没有则申请成功
+        ++shared_data;
+        // 作用域结束后会析构 然后释放锁
+    }
+}
+
+int main() {
+    std::thread t1(increment);
+    std::thread t2(increment);
+
+    t1.join();
+    t2.join();
+
+    std::cout << "Shared data: " << shared_data << std::endl;
+
+    return 0;
+}
+//这里主要是可以自动释放锁，而不用每次都手动释放！
+```
+RAII是资源获取即初始化，==使用局部对象来管理资源的技术称为资源获取即初始化，资源主要指 指针内存，网络套接字，文件等资源，局部对象主要是指存储在栈上的对象！由编译器来管理，无需手动管理！==
+## C++的智能指针解析
+C++面向内存编程，java面向数据结构编程。java有JVM这个进行内存回收的家长，但是C++则比较灵活，可以看到内存里的东西，但是也容易出现内存泄漏等条件。
+### C/C++ 常见的内存错误
+野指针：未初始化或已经被释放的指针被称为野指针
+空指针：指向空地址的指针被称为空指针
+内存泄漏：如果在使用完动态分配的内存后忘记释放，就会造成内存泄漏，长时间运行的程序可能会消耗大量内存。
+悬空指针：指向已经释放的内存的指针被称为悬空指针.
+内存泄漏和悬空指针的混合：在一些情况下，由于内存泄漏和悬空指针共同存在，程序可能会出现异常
+### 智能指针
+智能指针的核心思想就是RAII。
+主要有std::unique_ptr，std::shared_ptr，std::weak_ptr三类智能指针。
+### 两类智能指针
+```c++
+//std::unique_ptr是一个独占所有权的智能指针，它保证指向的内存只能由一个unique_ptr拥有，不能共享所有权。
+//原始指针或者引用可以指向这片内存，但是不推荐这么做！因为一旦独占指针释放，那么这些原始指针就会编程悬挂指针！ 其他智能指针指向独占指针指向的内存会直接报错！
+//需要验证！
+#include <memory>
+#include <iostream>
+
+int main() {
+    std::unique_ptr<int> ptr(new int(10));
+    std::cout << *ptr << std::endl; // 输出10
+    // unique_ptr在超出作用域时自动释放所拥有的内存
+    return 0;
+}
+
+//std::shared_ptr是一个共享所有权的智能指针，它允许多个shared_ptr指向同一个对象，当最后一个shared_ptr超出作用域时，所指向的内存才会被自动释放。
+//原始指针指向共享指针指向的内存，不会导致引用计数的增加！
+#include <memory>
+#include <iostream>
+
+int main() {
+    std::shared_ptr<int> ptr1(new int(10));
+    std::shared_ptr<int> ptr2 = ptr1; // 通过拷贝构造函数创建一个新的shared_ptr，此时引用计数为2
+    std::cout << *ptr1 << " " << *ptr2 << std::endl; // 输出10 10
+    // ptr2超出作用域时，所指向的内存不会被释放，因为此时ptr1仍然持有对该内存的引用
+    return 0;
+}
+```
+所以综上来说，不要混用普通指针和智能指针。推荐使用智能指针，避免内存泄漏和悬空指针的问题！智能指针并不是万能的，在需要手动管理内存的时候，不需使用！（在需要精操作和控制内存的高级场景，需要手动管理；如嵌入式编程，低级被系统；优化内存使用（一致性分配，释放会降低性能，内存碎片等），自定义内存池）.
+## 深入理解 C++ shared_ptr之手写
+#### shared_ptr的使用
+shared_ptr通过引用计数来实现记录有多少个shared_ptr共享同一个对象。
+```c++
+//如下是引用计数的简单输出
+#include <iostream>
+#include <memory>
+using namespace std;
+class MyClass {
+public:
+    MyClass() { std::cout << "MyClass 构造函数"<<endl; }
+    ~MyClass() { std::cout << "MyClass 析构函数"<<endl; }
+    void do_something() { std::cout << "MyClass::do_something() 被调用"<<endl; }
+};
+
+int main() {
+    {
+        std::shared_ptr<MyClass> ptr1 = std::make_shared<MyClass>();
+        {
+            std::shared_ptr<MyClass> ptr2 = ptr1; // 这里共享 MyClass 对象的所有权
+            ptr1->do_something();
+            ptr2->do_something();
+            std::cout << "ptr1 and ptr2 use_count " << ptr1.use_count() << " "<<ptr2.use_count()<<std::endl;
+        } // 这里 ptr2 被销毁，但是 MyClass 对象不会被删除，因为 ptr1 仍然拥有它的所有权
+        std::cout << "ptr1 use_count: " << ptr1.use_count() << std::endl;
+    } // 这里 ptr1 被销毁，同时 MyClass 对象也会被删除，因为它是最后一个拥有对象所有权的 shared_ptr
+
+    return 0;
+}
+```
+**引用计数的实现**：其实是所有的shared_ptr存储了一个指针变量，这个指针变量指向一个堆内存指针，引用计数变量就存在这个堆上，指针用于指向这个变量！
+### shared_ptr 的 double free 问题
+**double free就是一块内存空间释放两次**！
+- 直接使用原始指针创建多个 shared_ptr，而没有使用 shared_ptr 的 make_shared 工厂函数，从而导致多个独立的引用计数。
+- 循环引用，即两个或多个 shared_ptr 互相引用，导致引用计数永远无法降为零，从而无法释放内存。
+```c++
+//针对第一个使用多个原始指针来创建多个共享指针，而存在多个引用计数的情况。
+//对于使用原始指针来创建的情况,使用同一个原始指针创建的多个共享变量其实是不共享引用计数的，本质是因为这样创建的共享指针都有自己的控制块（包含引用计数等信息），这样共享变量有自己独立的引用计数，所以会造成double free问题。
+//所以这里正确使用共享指针的方法是，第一个指针使用std::make_shared或者原始指针拷贝构造方式，复制构造方式来创建，后续的共享指针，都基于前面已创建的共享指针来构造，这样才会共享同一个控制块，从而共享引用计数来保证不会发生double free问题
+#include <memory>
+#include <iostream>
+using namespace std;
+int main() {
+    int * temp = new int(10);
+    std::shared_ptr<int> s1(temp);
+    std::shared_ptr<int> s2(temp);
+    cout<<s1.use_count()<<" "<<s2.use_count()<<endl;//都为1
+    std::shared_ptr<char> s3 = std::make_shared<char>();
+    std::shared_ptr<char> s4(s3);
+    std::shared_ptr<char> s5 = s4;
+    cout<<s3.use_count()<<" "<<s4.use_count()<<" "<<s5.use_count()<<endl;//都为3
+    return 0;
+}
+
+//循环引用，即两个或多个 shared_ptr 互相引用，导致引用计数永远无法降为零，从而无法释放内存
+//如下就不会调用a，b对象的析构函数，因为a，b对应的智能指针的引用计数都不为0是2，所以当退出作用域时，a,b对应的智能指针引用计数减1，但不为0，是不会释放a，b对象的内存的，因为其引用计数不为0.类似于使用new指针初始化类对象，但不调用delete释放，这时程序退出，这块内存也不会被释放，造成内存泄漏。
+class B;
+
+class A {
+public:
+    std::shared_ptr<B> b_ptr;
+    ~A() { std::cout << "A deleted\n"; }
+};
+
+class B {
+public:
+    std::shared_ptr<A> a_ptr;
+    ~B() { std::cout << "B deleted\n"; }
+};
+
+int main() {
+    {
+        std::shared_ptr<A> a(new A());//开辟了A，B对象的内存。a,b智能指针指向这片内存
+        std::shared_ptr<B> b(new B());
+        a->b_ptr = b;
+        b->a_ptr = a;
+    }//离开作用域。a,b智能指针出作用域析构，但无法释放A,B对象的内存，因为这片内存的引用计数不为0.
+    return 0;
+}
+```
+### 如何解决 double free
+- 使用 make_shared 函数创建 shared_ptr 实例，而不是直接使用原始指针。这样可以确保所有 shared_ptr 实例共享相的引用计数。
+- 对于可能产生循环引用的情况，使用 weak_ptr。weak_ptr 是一种不控制对象生命周期的智能指针，它只观察对象，而不增加引用计数。这可以避免循环引用导致的内存泄漏问题。
+```c++
+//针对循环引用的情况，可是使用weak_ptr来打破这个 循环
+#include <memory>
+#include <iostream>
+class B;
+
+class A {
+public:
+    std::shared_ptr<B> b_ptr;
+    ~A() { std::cout << "A deleted\n"; }
+};
+
+class B {
+public:
+    std::weak_ptr<A> a_ptr;//使用weak_ptr来打破这个循环，不增加引用计数
+    ~B() { std::cout << "B deleted\n"; }
+};
+
+int main() {
+    {
+        std::shared_ptr<A> a(new A());
+        std::shared_ptr<B> b(new B());
+        a->b_ptr = b;
+        b->a_ptr = a;
+    }//具体的逻辑就是，对A，B这块对象内存区域，由于b->a_ptr为weak_ptr所以引用计数为1，出作用域，a被析构连带着A对象内存被析构，然后出作用域b被析构，然后A对象被析构，所以A对象里面的b_ptr被析构，所以引用计数减为0，释放B对象内存。
+    
+    return 0;
+}
+
+//!使用weak_ptr需要注意的点：
+// - 如果需要访问 weak_ptr 所指向的对象，需要将std::weak_ptr 通过 weak_ptr::lock() 临时转std::shared_ptr.（本质是weak_ptr没有对应对象的拥有权，通过这个weak_ptr.lock()方法获取到对应的shared_ptr;此外可以通过该方法返回的指针是否为空判断对应的对象是否被释放！而不用使用shared_ptr去访问可能已经释放的内存）
+// 在使用lock()方法之前，应当检查使用 std::weak_ptr::expired() 检查 std::weak_ptr是否有效，即它所指向的对象是否仍然存在。（和上面的weak_ptr.lock（）方法返回的指针是否为空异曲同工，判断对应的内存是否被释放）
+```
+### enable_shared_from_this
+
+
+
