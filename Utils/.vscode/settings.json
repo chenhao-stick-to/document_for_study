@@ -29,7 +29,7 @@
     ],
     // 版权信息模板
     "doxdocgen.file.copyrightTag": [
-        "@copyright ndsl"
+        "@copyright mine"
     ],
     // 自定义模块，此处为修改日志
     "doxdocgen.file.customTag": [
@@ -38,15 +38,15 @@
         "---------------------------------------------------------------------------",
         "   <Date>   | <Version> |    <Author>   |    <Description>                ",
         "---------------------------------------------------------------------------",
-        " {date} |   2.0.0   |     {author}    |     modify the version               ",
+        " {date} |   1.0.0   |     {author}    |     modify the version               ",
         "---------------------------------------------------------------------------",
     ],
     // 上述标签tag的具体信息格式模板
     "doxdocgen.file.fileTemplate": "@file   {name}",
-    "doxdocgen.generic.authorEmail": "443248173@qq.com",
-    "doxdocgen.generic.authorName": "wangxu",
+    "doxdocgen.generic.authorEmail": "3301273828@qq.com",
+    "doxdocgen.generic.authorName": "haochen",
     "doxdocgen.generic.authorTag": "@author {author} ({email})",
-    "doxdocgen.generic.dateFormat": "2023/08/23",
+    "doxdocgen.generic.dateFormat": "2024/3/12",
     "doxdocgen.generic.dateTemplate": "@date   {date}",
     // 函数注释序列（主要体现在函数注释上）
     "doxdocgen.generic.order": [

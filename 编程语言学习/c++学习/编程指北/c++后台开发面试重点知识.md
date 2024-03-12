@@ -1343,7 +1343,209 @@ int main() {
 // - 如果需要访问 weak_ptr 所指向的对象，需要将std::weak_ptr 通过 weak_ptr::lock() 临时转std::shared_ptr.（本质是weak_ptr没有对应对象的拥有权，通过这个weak_ptr.lock()方法获取到对应的shared_ptr;此外可以通过该方法返回的指针是否为空判断对应的对象是否被释放！而不用使用shared_ptr去访问可能已经释放的内存）
 // 在使用lock()方法之前，应当检查使用 std::weak_ptr::expired() 检查 std::weak_ptr是否有效，即它所指向的对象是否仍然存在。（和上面的weak_ptr.lock（）方法返回的指针是否为空异曲同工，判断对应的内存是否被释放）
 ```
+使用原始指针来赋值智能指针的时候，这个指针所指对象的释放就应该交由智能指针来进行管理，而不是由原始指针来对这片内存进行管理释放！所以在使用原始指针赋值智能指针后，原始指针一个置为null。
+```c++
+#include <memory>
+#include <iostream>
+using namespace std;
+class B;
+
+class A {
+public:
+    std::shared_ptr<B> b_ptr;
+    int a;
+    ~A() { std::cout << "A deleted\n"; }
+};
+
+class B {
+public:
+    std::weak_ptr<A> a_ptr;
+    ~B() { std::cout << "B deleted\n"; }
+};
+
+int main() {//如下，在使用原始指针赋值智能指针后，又显示delete释放原始指针指向的内存，造成double free的问题，值得注意的是，即时内存被释放，有些时候还是能访问对象的成员，本质上是因为，os不会立即删除释放的内存，只是标记为可回收重新分配，等待下次重新分配。但是这种访问释放内存的值的方法是不可取的，应该避免！
+    A* temp = new A();
+    {
+        std::shared_ptr<A> a(temp);
+        std::shared_ptr<B> b(new B());
+        delete temp;
+        cout<<a.use_count()<<b.use_count()<<endl;
+        a->b_ptr = b;
+        b->a_ptr = a;
+        cout<<a.use_count()<<b.use_count()<<endl;
+    }
+    temp->a =10;
+    cout<<temp->a<<endl;
+    return 0;
+}
+```
+
 ### enable_shared_from_this
+即允许从类自身的this指针构造shared_ptr;
+```c++
+//需要将this指针传递给其他函数或方法
+struct SomeData;
+void SomeAPI(const std::shared_ptr<SomeData>& d) {}
 
+struct SomeData {
+    void NeedCallSomeAPI() {//这样是错误的，因为this指针指向的内存被智能指针接管，在调用完这个SomeAPI后，
+    //这片智能指针指向的内存会被释放！
+        SomeAPI(std::shared_ptr<SomeData>{this});
+    }
+};
 
+//这种情况使用std::enable_shared_from_this 
+#include <memory>
+
+struct SomeData;
+void SomeAPI(const std::shared_ptr<SomeData>& d) {}
+
+struct SomeData:std::enable_shared_from_this<SomeData> {//继承自std::enable_shared_from_this<类类型>
+    static std::shared_ptr<SomeData> Create() {//静态函数
+        return std::shared_ptr<SomeData>(new SomeData);
+    }
+    void NeedCallSomeAPI() {
+        SomeAPI(shared_from_this());//需要传本类对象的智能指针，则直接传递这个！这样会保证this指针不会被释放，即对类对象不会被释放，且不会出现内存释放的问题。
+    }
+private:
+    SomeData() {}
+};
+
+int main()
+{
+    auto d{ SomeData::Create() };//这里用列表初始化d值，create()函数临时创建一个共享指针返回，然后赋值给d，这时引用计数为2。但是这行代码一结束，这个临时返回值会被析构，所以引用计数又变为1！
+    d->NeedCallSomeAPI();
+}
+```
+两类情况需要使用到enable_shared_from_this:
+- 当你需要将this指针传递给其他函数或方法，而这些函数或方法需要一个std::shared_ptr，而不是裸指针。
+- 当你需要在类的成员函数内部创建指向当前对象的std::shared_ptr，例如在回调函数或事件处理中。
+**shared_from_this()实现的大致步骤是，首先需要保证已有一个智能指针指向这个对象，然后这个类继承自enable_shared_from_this<类>，这个父类有一个weak_ptr变量，所以子类也继承有std::weak_ptr；这样在开始智能指针初始化指向这个类对象时，这个weak_ptr就会被初始化也指向这个对象，共享同一个控制块。这样shared_from_this使用std::weak_ptr.lock()就可以获取指向这个对象的共享指针！**
+### 线程安全性
+shared_ptr线程不安全，主要来自于引用计数的并发更新。可以使用atomic来原子操作引用计数。可以使用互斥锁，原子操作来确保线程安全的操作。总的来说还是需要互斥锁来保证共享指针引用计数的更新，防止读后写，写后读的情况。
+### 手写shared_ptr
+```c++
+#include <iostream>
+using namespace std;
+template <typename T> //模板用于接收各种类型
+class MySimpleSharedPtr{
+    public:
+        explicit MySimpleSharedPtr(T* ptr = nullptr):ptr_(ptr),count_(ptr?new size_t(1):nullptr) {}//只能接收显示构造，make_shared不存在
+        MySimpleSharedPtr (const MySimpleSharedPtr& other):ptr_(other.ptr_),count_(other.count_) {//不需返回引用，为构造函数，初始化对象。
+            if (count_)              
+                (*count_)++;
+            cout<<"copy constructor!"<<endl;
+        }
+
+        MySimpleSharedPtr& operator = (const MySimpleSharedPtr& other) {//需要返回整个对象来进行赋值操作
+        if (this != &other) {//保证不是自己给自己赋值
+            release();//释放掉智能指针指向的原来的对象的对应的引用计数，为0时，释放原来的对象的内存
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            (*count_)++;//当前对象的引用计数加1，智能指针对象加1.
+        }
+        cout<<"= constructor"<<endl;
+        return *this;
+        }
+
+        ~MySimpleSharedPtr() {
+            release();
+        }
+        T& operator *() const{//const禁止修改成员变量。
+            return *ptr_;
+        }
+        T* operator ->() const{
+            return ptr_;
+        }
+        T* get() const{
+            return ptr_;
+        }
+        size_t use_count() {
+            return count_?*count_:0;
+        }
+    private:
+        release(){
+            if (count_ && (*count_)-- == 0) {
+                delete ptr_;
+                delete count_;
+            }
+        }
+        T* ptr_;
+        size_t* count_;//一定要注意判断count_和ptr_的有效值，虽然理论上没什么问题
+};
+class A {
+    public:
+        A(){}
+        int a = 10;
+};
+int main() {
+    MySimpleSharedPtr<int> a(new int(1));
+    MySimpleSharedPtr<int> b(a);
+    cout<<'1'<<endl;
+    MySimpleSharedPtr<int> c = b;//调用拷贝构造函数，因为是在声明和初始化
+    MySimpleSharedPtr<int> d(new int(3));
+    MySimpleSharedPtr<int> e(d);
+    d = a;//这个调用赋值运算符函数，因为两个都已经初始化
+    cout<<a.use_count()<<" "<<b.use_count()<< " "<<c.use_count()<<" "<<d.use_count()<<" "<<e.use_count()<<endl;
+    // MySimpleSharedPtr<A> a(new A());
+    // MySimpleSharedPtr<A> b(a);
+    // b->a = 11;
+    // MySimpleSharedPtr<A> c = b;
+    // cout<<(*a).a<<" "<<b->a<<endl;
+    // A* temp = c.get();
+    // temp->a = 22;
+    // cout << (*a).a<<" "<<b->a<<" "<<temp->a<<endl;
+    // temp = nullptr;
+    // {MySimpleSharedPtr<A> d(c);
+    //     temp = d.get();
+    //     d->a = 1;
+    //     cout<<temp<<" "<<temp->a<<endl;
+    // }
+    // cout<<temp<<" "<<temp->a<<endl;
+
+}
+//没有实现高级的功能，如自定义删除器，std::make_shared,std::allocate_shared()，线程安全性。
+```
+### shared_ptr常用的API
+```c++
+std::shared_ptr<int> ptr = std::make_shared<int>(42);
+//make_shared相比于直接使用shared_ptr的优点，-一次性分配对象和智能指针控制块的内存，比构造函数的两次分配更优秀。-一次分配连续内存，避免内存碎片。-make_shared避免裸指针初始化，更加安全!
+
+ptr.reset(new int(42));
+//释放原智能指针所有权，重新赋值。类似于 =重新赋值。不一样的是reset在适配新对象时，适配失败则会恢复ptr不改变。而= 赋值不一样的是，进入函数时，可能已经原指针的引用计数已减1甚至对应的对象内存被释放掉了；但是最后的赋值阶段却失败了。= 重新赋值可以赋值智能指针；但是reset只能接收一个原始指针进行初始化！
+
+int* raw_ptr = ptr.get();//注意这个暴露的裸指针，需谨慎操作，不用来初始化其他智能指针
+
+bool is_unique = ptr.unique();//用来检查当前指针是否拥有唯一的对象所有权，即use_count()==1
+
+std::shared_ptr<int> ptr1 = std::make_shared<int>(42);//交换两个ptr的内容！
+std::shared_ptr<int> ptr2 = std::make_shared<int>(24);
+ptr1.swap(ptr2);
+
+if (ptr) {//检查智能指针是否为空
+    std::cout << "ptr 不为空" << std::endl;
+} else {
+    std::cout << "ptr 为空" << std::endl;
+}
+```
+## 深入理解 C++ weak_ptr
+- 解决循环引用的问题.
+- 观察std::shared_ptr，监视std::shared_ptr的生命周期，如weak_ptr.lock()可以检查对象是否被释放！
+## 深入理解weak_ptr：资源所有权问题
+weak_ptr除了解决循环引用，还能解决什么？
+**一切应该不具有对象所有权**，**又想安全访问对象的情况**。只观察对象的状态，而不会改变对象的状态。
+```c++
+//对象资源竞争的情况，在多线程的情况下，是可能出错的，因为wp.expired()，wp.lock()在运行期间可能被释放掉。
+std::weak_ptr<SomeClass> wp{ sp };
+if (!wp.expired()) {
+    wp.lock()->DoSomething();//可能wp.lock()返回空引发程序错误！
+}
+
+//正确做法
+auto sp = wp.lock();//先保证自己线程有一个拥有对象所有权的智能指针，避免被其他线程释放！
+if (sp) {
+    sp->DoSomething();
+}
+```
+### c++ malloc,new,free,delete的区别
 
