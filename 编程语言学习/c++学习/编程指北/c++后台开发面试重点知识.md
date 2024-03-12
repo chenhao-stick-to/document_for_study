@@ -1547,5 +1547,46 @@ if (sp) {
     sp->DoSomething();
 }
 ```
-### c++ malloc,new,free,delete的区别
+## C/C++ malloc-free底层原理-动态内存管理
+虚拟内存机制：物理和虚拟地址空间、TLB 页表、内存映射
+动态内存管理：内存管理、分配方式、内存回收、GC等等
+### 内存映射mmap
+- 内核映射段：内核将硬盘文件内容直接映射到内存，mmap()系统调用请求这种映射。
+- 内存映射是一种方便高效的文件 I/O 方式， 因而被用于装载动态共享库。
+- 用户也可创建匿名内存映射，该映射没有对应的文件，可用于存放程序数据。==malloc()请求内存时，大于默认值128KB(mallopt()调整)，则使用mmap系统调用的匿名内存映射。==
+- mmap 映射区向下扩展，堆向上扩展，两者相对扩展，直到耗尽虚拟地址空间中的剩余区域
+注意：==start_stack为栈区的起始地址，栈区大小在编译器时期确定，运行时不能改变==
+堆的大小由start_brk()到brk()决定。malloc()库函数进行堆上的空间（两个之间的内存）动态分配，如果这片内存不够用，则调用brk()/sbrk()增大brk值，及增大堆空间！
+### 相关系统调用
+#### brk()和sbrk()
+```c++
+#include <unistd.h>
+int brk(void *addr);//增大到指定地址,成功0，失败-1
+void *sbrk(intptr_t increment);//增加了increment的大小！，成功返回break指针移动前指向的地址，否则-1.
+//如果break的设置地址没有按页对齐，由于linux是按页映射，所以最后会映射一个完整的页，实际映射地址空间比break的要大此时！
+```
+受到物理内存的限制，进程的整个虚拟内存空间不会全部映射到实际的物理内存。因此进程由rlimit表示自己的进程可用资源上限，getrlimit()系统调用可获取。如下是常见的一些限制：
+RLIMIT_CPU：CPU使用的时间上限，单位为秒。当进程达到此限制的时候，会向进程发送一个SIGXCPU信号。
+RLIMIT_FSIZE：可以创建的文件的最大尺寸。当进程试图超过此限制创建文件，会收到SIGXFSZ信号。
+RLIMIT_DATA：进程数据段的最大尺寸。
+RLIMIT_STACK：栈的最大尺寸.
+RLIMIT_CORE：内核转储文件的最大长度。
+RLIMIT_RSS：最大驻留集尺寸，这限制了进程可能的物理内存使用量。
+RLIMIT_NPROC：单个用户可以拥有的进程数上限。
+RLIMIT_NOFILE：进程可以打开的文件描述符的最大数目。
+RLIMIT_MEMLOCK：进程可以锁定在内存中的最大地址空间。
+RLIMIT_AS：进程的最大虚拟内存空间。
+#### mmap()函数
+![image-20240312234202832](c++后台开发面试重点知识/image-20240312234202832.png)
+如上展示了malloc函数的分配情况。小于阈值DEFAULT_MMAP_THRESHOLD则在堆内存池分配，不够则调用sbrk()/brk()分配堆内存。大于阈值则mmap直接匿名映射。
+### malloc实现方案
+malloc采用内存池的实现方式，即先申请一大块内存（避免多次系统调用，非常影响性能），将内存分为不同大小的内存块，用户申请，直接从内存池中选择一块相近的内存块。
+![image-20240312235903194](c++后台开发面试重点知识/image-20240312235903194.png)
+如上图，堆的内存保存在bins这个长128的数组中，每个元素是双向链表。
+bins[0]目前没有使用。bins[1]的链表称为unsorted_list，用于维护free释放的chunk。bins[2,63)的区间称为small_bins，用于维护＜512字节的内存块，其中每个元素对应的链表中的chunk大小相同，均为index*8。bins[64,127)称为large_bins，用于维护>512字节的内存块，每个元素对应的链表中的chunk大小不同，index越大，链表中chunk的内存大小相差越大。
+unsorted_bin存储free掉的chunk；small_bins相邻的bin差8B，large_bins相邻的bin差64B。最后有一个fast_bins.fast_bins用于保存那些不大于max_fast(64B默认)的chunk，且不改变chunk的使用标志P，则不会对该chunk进行合并！用户分配的chunk小于等于max_fase的时候，malloc首先在fast_bins（==目的其实是局部性原理，避免刚释放的小块内存又被申请！加快速度==）查找相应的块，再去其它bins查找。
+==fast_bins到特定时，会合并chunk，并将这些chunk加入到unsorted_bins中,释放的大于max_fast的chunk也会加入到unsorted_bins中==
+==所以当查找一个空用的chunk时，首先fast_bins查找，再去unsorted_bins，如果没有再将unsorted_bins中的chunk加入到其他bins中，然后在从这些bins查找合适的chunk！unsorted_bins/fast_bins 可以看做是 bins 的一个缓冲区，增加它只是为了加快分配的速度.==
 
+
+## c++ malloc,new,free,delete的区别
