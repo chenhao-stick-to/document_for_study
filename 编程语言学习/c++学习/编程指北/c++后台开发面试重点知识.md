@@ -1587,6 +1587,39 @@ bins[0]目前没有使用。bins[1]的链表称为unsorted_list，用于维护fr
 unsorted_bin存储free掉的chunk；small_bins相邻的bin差8B，large_bins相邻的bin差64B。最后有一个fast_bins.fast_bins用于保存那些不大于max_fast(64B默认)的chunk，且不改变chunk的使用标志P，则不会对该chunk进行合并！用户分配的chunk小于等于max_fase的时候，malloc首先在fast_bins（==目的其实是局部性原理，避免刚释放的小块内存又被申请！加快速度==）查找相应的块，再去其它bins查找。
 ==fast_bins到特定时，会合并chunk，并将这些chunk加入到unsorted_bins中,释放的大于max_fast的chunk也会加入到unsorted_bins中==
 ==所以当查找一个空用的chunk时，首先fast_bins查找，再去unsorted_bins，如果没有再将unsorted_bins中的chunk加入到其他bins中，然后在从这些bins查找合适的chunk！unsorted_bins/fast_bins 可以看做是 bins 的一个缓冲区，增加它只是为了加快分配的速度.==
-
-
+除了上面4种bins，还有三种内存分区。
+- top chunk:当fast bin和bins都不能满足内存需求时，malloc会设法在top chunk中分配一块内存给用户。top chunk是堆顶的chunk。堆顶指针brk在top chunk的顶部。可移动brk指针扩大top chunk大小。top chunk >128KB且空闲的时候，触发malloc_trim。调用sbrk(-size)归还给os。这里需要注意的是如果一次申请的堆内存加上原来的top chunk的内存大于128KB不影响（其实已经是两个chunk了，原来的那个不是top chunk了），最后再释放归还即可。
+- 一次申请大于128KB,则top chunk无法满足。需要使用mmap直接将页映射到进程空间。chunk释放，直接解除映射，释放内存。（申请内存极限大的时候使用)
+- last_remainder,需要分配一个small chunk但无法再small bins中找到。如last_remainder chunk > 所需small chunk。那么last_remainder chunk 分裂成两个。一个返回给用户，另一个为新的last_remainder chunk!（申请内存极限小的时候使用)
+下图是正在使用chunk和空闲chunk的情况。
+![image-20240313193534356](c++后台开发面试重点知识.assets/image-20240313193534356.png)
+chunk指针指向chunk开始的地方，返回给用户的是mem指针。如图不难发现，chunk有size元素，所以free在释放这块内存时，知道释放多少大小！
+chunk的第二个域，有A，M,P三个关键字
+A:表示chunk处于主分配区（1）还是非主分配区（0）。P:0表示为空闲块，1则是在使用的块。为0时，chunk的第一个域的prev_size有效，即前一个chunk的size。故可以找到上一个chunk的起始地址，获取上一个chunk。M:从哪个区域获取的内存chunk。heap区域（0），mmap映射区（1）.
+在large bin中的空闲chunk，还有两个指针，fd_nextsize和bk_nextsize，用于加快在large bin中查找最近匹配的空闲chunk。
+### malloc内存分配流程
+- 如果分配内存<512字节，则通过内存大小定位到smallbins对应的index上(floor(size/8))
+    如果smallbins[index]为空，进入步骤3
+    如果smallbins[index]非空，直接返回第一个chunk
+- 如果分配内存>512字节，则定位到largebins对应的index上
+    如果largebins[index]为空，进入步骤3
+    如果largebins[index]非空，扫描链表，找到第一个大小最合适的chunk，如size=12.5K，则使用chunk B，剩下的0.5k放入unsorted_list中
+- 遍历unsorted_list，查找合适size的chunk，如果找到则返回；否则，将这些chunk都归类放到smallbins和largebins里面
+- index++从更大的链表中查找，直到找到合适大小的chunk为止，找到后将chunk拆分，并将剩余的加入到unsorted_list中
+- 如果还没有找到，那么使用top chunk
+- 或者，内存<128k，使用brk；内存>128k，使用mmap获取新内存
+总结一下大概是，小于max_fast，则从fast_bin中去寻找合适的chunk。大于128KB,则mmap分配合适的chunk。fast_bin中找不到，就会根据申请字节数对应到bins对应的index，这个index上有chunk就返回。没有就去unorder_bins中去寻找，找到就返回，否则将unordered的bins归类到对应的bins中，然后index++,去更大的bins中寻找，直到找到合适的chunk，并且找到后拆分chunk，多余部分放到unorder bins。
+### 内存碎片
+chunk和top chunk相邻，则和top chunk合并 chunk和top chunk不相邻，则直接插入到unsorted_list中。
+这种情况：malloc 40k内存，即chunkA，brk = 512k + 40k = 552k malloc 50k内存，即chunkB，brk = 552k + 50k = 602k malloc 60k内存，即chunkC，brk = 602k + 60k = 662k free chunkA。堆顶指针brk为662k。但是释放内存为chunkA，显然brk无法移动，所以[512K,552K)为内存碎片。需要将chunkA放入到unorder bin链表中。
+### 其他
+#### 显式空闲链表
+![image-20240313201312796](c++后台开发面试重点知识.assets/image-20240313201312796.png)
+使用双向链表而不是隐式空闲链表，减少首次适配时间，从块总数减少到了空闲块数量时间。
+链表维护：后入先出LIFO的栈的形式（局部性原理，很可能再次使用！），按地址从低到高，比LIFO的首次适配有更高内存利用率。
+#### 分离适配
+即malloc常用的。GNU malloc包用的就是，即分为不同的区间，就是上面的bins一样的实现，每个区间有一个chunk的范围。则分配直接到对应的大小类找，找不到往更大类找，可以分割（可选，分割的保存到unorder bin中）。对分离空闲链表的首次适配搜索，内存利用率接近整个堆的最佳适配搜索。但是搜索时间大幅度减少。
+#### 伙伴系统
+==为分离适配的特例，即每个空闲连链表对应的是2^k大小。用在zone区域分配物理页框中！==
+伙伴系统很容易获得伙伴的物理地址！
 ## c++ malloc,new,free,delete的区别
