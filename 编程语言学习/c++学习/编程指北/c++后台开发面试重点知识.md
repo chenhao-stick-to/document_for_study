@@ -122,7 +122,7 @@ const int i = 1;        //定义 (不用 extern 修饰)
 extern const int i;
 ```
 3） 编译和链接过程
-编译期，extern告诉编译器该变量定义在其他函数中，建立一个该符合引用，是一个未定义的符号。
+编译期，extern告诉编译器该变量定义在其他函数中，建立一个该符号引用，是一个未定义的符号。
 链接期，其他目标文件找到定义，链接。
 ## C++中volatile作用
 volatile关键字可以禁止被进行外部因素更改，如硬件，os/编译器，其他线程等。
@@ -1595,7 +1595,7 @@ unsorted_bin存储free掉的chunk；small_bins相邻的bin差8B，large_bins相�
 ![image-20240313193534356](c++后台开发面试重点知识.assets/image-20240313193534356.png)
 chunk指针指向chunk开始的地方，返回给用户的是mem指针。如图不难发现，chunk有size元素，所以free在释放这块内存时，知道释放多少大小！
 chunk的第二个域，有A，M,P三个关键字
-A:表示chunk处于主分配区（1）还是非主分配区（0）。P:0表示为空闲块，1则是在使用的块。为0时，chunk的第一个域的prev_size有效，即前一个chunk的size。故可以找到上一个chunk的起始地址，获取上一个chunk。M:从哪个区域获取的内存chunk。heap区域（0），mmap映射区（1）.
+A:表示chunk处于主分配区（1）还是非主分配区（0）。P:0表示为空闲块，1则是在使用的块。为0时，chunk的第一个域的prev_size有效，即前一个chunk的size。故可以找到上一个chunk的起始地址，获取上一个chunk。M:从哪个区域获取的内存chunk。heap区域（0），mmap映射区（1).
 在large bin中的空闲chunk，还有两个指针，fd_nextsize和bk_nextsize，用于加快在large bin中查找最近匹配的空闲chunk。
 ### malloc内存分配流程
 - 如果分配内存<512字节，则通过内存大小定位到smallbins对应的index上(floor(size/8))
@@ -1623,3 +1623,131 @@ chunk和top chunk相邻，则和top chunk合并 chunk和top chunk不相邻，则
 ==为分离适配的特例，即每个空闲连链表对应的是2^k大小。用在zone区域分配物理页框中！==
 伙伴系统很容易获得伙伴的物理地址！
 ## c++ malloc,new,free,delete的区别
+```c++
+//malloc分配内存
+#include <cstdlib>
+int main() {
+    // 使用 malloc 分配内存
+    int *ptr = (int *)malloc(sizeof(int));
+    // 记得在使用完之后释放内存
+    free(ptr);
+}
+//new分配内存
+int main() {
+    // 使用 new 分配内存并调用构造函数
+    int *ptr = new int;
+    // 记得在使用完之后释放内存
+    delete ptr;
+}
+/*简单对比
+malloc返回void*指针，需要自己进行转换；new直接返回对象指针。
+malloc只分配内存，而new可以调用对象的构造函数进行初始化。
+malloc需要传入分配的大小，但是new会自动计算对象大小。
+*/
+```
+下面时malloc，new的具体区别：
+![image-20240313233346265](c++后台开发面试重点知识/image-20240313233346265.png)
+自由存储区：基本等价于堆区。
+```c++
+//new可以不为对象分配内存，可以在指定内存块进行对象的初始化
+//placement_new可以做好
+//表现形式
+new (place_address) type
+void * operator new (size_t,void *) //不允许重定义这个版本的operator new
+
+//完整实例
+#include <new> // 需要包含此头文件以使用 placement new
+#include <iostream>
+
+class MyClass {
+public:
+    int data;
+    MyClass(int value) : data(value) {
+        std::cout << "构造函数调用，data：" << data << std::endl;
+    }
+    ~MyClass() {
+        std::cout << "析构函数调用，data：" << data << std::endl;
+    }
+};
+
+int main() {
+    char buffer[50]; // 地址的内存块，这里只是个例子并不推荐这样使用
+
+    // 在buffer的地址上构造对象
+    MyClass* object = new (buffer) MyClass(123);//这里是在buffer这块内存区域进行Myclass的初始化
+
+    // 析构我们在buffer上手动构造的对象，注意不要使用delete object!
+    object->~MyClass(); //但是这个对象的释放，不是由delete 来进行释放，而是用户显示的调用对象的析构函数来进行释放。本质是这块内存不是new申请的，所以不用delete释放
+
+    return 0;
+}
+//placement_new使用场景
+/*自定义内存分配：如果你想在特定的内存位置创建对象，比如在一个预分配的大型内存池或缓冲区中，可以使用 "placement new"。这样可以避免每次创建对象时都进行内存分配，提高内存利用率，降低了内存分配和释放的开销。
+内存对齐：有些硬件对内存访问有严格的对齐要求，"placement new" 可以对齐分配对象。
+嵌入式系统/操作系统内核编程：在这些情况下，程序员需要控制对象在物理或虚拟内存中的精确位置。例如，某些特定的硬件寄存器可以被映射为特定地址上的对象。
+构造大型对象或数组：有时，直接使用 "new" 会引发异常，或者因为内存不足而失败。这时，你可以分步骤分配内存，然后用 "placement new" 构造对象。
+重复使用内存：如果需要在同一块内存上反复构造和析构对象，"placement new" 是非常适合的。例如，在编写内存池或自定义分配器时。
+*/
+```
+内存分配失败：new抛出异常，所以一般可以用try{}catch(){}获取错误。malloc则是直接返回null，可用来判断是否分配成功。
+对于数组的处理，new[]一定记住和delete[]配对使用/new和delete配对使用，如果new[]分配数组，但是释放用delete，可能会造成内存泄漏==(new[]分配数组编译器会额外分配内存记录数组信息，如元素个数；使用delete不能正确获取数组信息，调用构造函数释放所有元素，可能造成内存泄漏。但是如果数组都是普通类型，或者类类型但是类里面没有指针或者引用资源待释放，理论上来说，即使不调用类的析构函数，这个数组也不会存在内存泄漏。但是由于new[]分配内存时，会额外分配数组信息的内存，这块内存无法释放，所以还是有内存泄漏。所以最好的方法是配对使用！)==。
+new可以调用malloc来进行实现，当malloc本身为系统调用。
+```c++
+void * operator new (sieze_t size)
+{
+    if(void * mem = malloc(size)
+        return mem;
+    else
+        throw bad_alloc();
+}
+void operator delete(void *mem) noexcept
+{
+    free(mem);
+}
+```
+最后是重新分配内存，malloc可以使用realloc再分配内存（realloc 先判断当前的指针所指内存是否有足够的连续空间，如果有，原地扩大可分配的内存地址，并且返回原来的地址指针；如果空间不够，先按照新指定的大小分配空间，将原有数据从头到尾拷贝到新分配的内存区域，而后释放原来的内存区域）；new不可以。
+```c++
+//下面是realloc实例
+#include <iostream>
+#include <cstdlib> // 包含了 `malloc` 和 `realloc` 的定义
+
+int main() {
+    int* array = (int*) malloc(5 * sizeof(int));  // 分配内存空间，可以存储5个int
+
+    // 检查是否成功分配内存
+    if (array == nullptr) {
+        std::cout << "Memory allocation failed" << std::endl;
+        return 1;
+    }
+
+    // 填充数组
+    for(int i = 0; i < 5; i++) {
+        array[i] = i;
+    }
+
+    // 使用realloc来扩展内存空间，可以存储10个int
+    array = (int*) realloc(array, 10 * sizeof(int));//传入待扩充的指针的指向的地址
+
+    // 检查是否成功重新分配内存
+    if (array == nullptr) {
+        std::cout << "Memory reallocation failed" << std::endl;
+        return 1;
+    }
+
+    // 再填充新增的空间
+    for(int i = 5; i < 10; i++) {
+        array[i] = i;
+    }
+
+    // 输出数组的内容
+    for(int i = 0; i < 10; i++) {
+        std::cout << "Element " << i << " is " << array[i] << std::endl;
+    }
+
+    // 使用free释放内存
+    free(array);
+
+    return 0;
+}
+```
+## C/C++ 内存泄露如何定位、检测以及避免
