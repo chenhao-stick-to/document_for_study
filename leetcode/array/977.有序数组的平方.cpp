@@ -4,7 +4,7 @@
  * [977] 有序数组的平方
  */
 
-class Solution {
+class Solution {//如果限定空间复杂度O（1）.如何解决？
 public:
     vector<int> sortedSquares(vector<int>& nums) {
         int i = 0;

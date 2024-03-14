@@ -48,7 +48,7 @@ public:
         int tmp_n = n;
         while(loop < loop_max) {//循环终止条件
             for(int i = 0; i <= n-1-2*loop; i++) {//左闭又开
-                if(i + loop != n-1-loop | i == 0){//表示 i到最大值不进行赋值操作（左闭右开）/i==0表示刚开始需要进行赋值操作（防止最大值为i==0时取得）
+                if(i + loop != n-1-loop || i == 0){//表示 i到最大值不进行赋值操作（左闭右开）/i==0表示刚开始需要进行赋值操作（防止最大值为i==0时取得）
                     martix_result[loop][i+loop] = i + 1 + sum;
                     martix_result[i+loop][n-loop-1] = tmp_n + i + sum;
                     martix_result[n-loop-1][n-i-1-loop] = 2*tmp_n - 1 + i + sum;

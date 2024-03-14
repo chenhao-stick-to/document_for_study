@@ -10,11 +10,10 @@ class Solution//这里仅适用于左闭右闭区间，左闭右开区间有一�
 public:
     int search(vector<int> &nums, int target)
     {
-        
         int left = 0;
         int right = nums.size()-1;
         while(left <= right){
-            int middle = (left+right)/2;
+            int middle = (left+right)/2;//开改成右移
             if(nums[middle] == target){
                 return middle;
             }else if(nums[middle]>target){

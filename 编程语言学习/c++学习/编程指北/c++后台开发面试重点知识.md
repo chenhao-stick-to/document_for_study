@@ -1751,3 +1751,225 @@ int main() {
 }
 ```
 ## C/C++ 内存泄露如何定位、检测以及避免
+内存泄漏是什么？ 即在程序中申请了动态内存，却没有释放，程序长期运行，最终导致没有内存可供分配！
+==不少大厂的服务有个特点，就是会定期重启服务进程，重启的目的就是让操作系统回收整个进程的资源包括内存，这样一点点的内存泄露问题即使无法定位，也不是什么大问题哈哈哈==
+### 如何检测
+- 手动检查代码，检查内存释放，malloc/free;new/delete是否配对。
+- 使用调试器/工具
+1）vagrind（linux,macos）,可以检测内存泄露、未初始化的内存访问、数组越界等问题.valgrind --leak-check=yes your_program进行检测。
+2） VS中的CRT的调试功能。
+3）AddressScanitizer:用于检测内存错误的编译器插件。gcc/clang。编译时加上 -fsanitize=address。
+==AddressScanitizer工具使用（快速内存检测，比valgrind快很多）==
+在程序编译时加上-fsanitize=address，然后开始运行。一般gcc -fsanitize=address -fno-omit-frame-pointer -O1 -g use-after-free.c -o use-after-free。其中-fno-omit-frame-pointer更容易理解stack free.
+错误类型： (heap) use after free 释放后使用。 heap buffer overflow 堆缓存访问溢出（如堆上数组访问越界）。 stack buffer overflow 栈缓存访问溢出（如栈上数组访问越界）。global buffer overflow 全局缓冲访问溢出（全局数组访问越界）。use after return。use after scope（访问超过超过变量生命周期的变量！）。initializations order bugs（c++中的初始化顺序有规定。全局/局部静态/类的成员对象等。程序中的复杂的对象交叉依赖，导致初始化顺序不一样，可能使用未初始化的对象，产生未定义行为）。==memory leaks 内存泄露==。
+```c++
+#include <iostream>
+using namespace std;
+int main() {
+    int x;
+    if (x == 1) {//使用未初始化内存可定位
+        cout<<"1"<<endl;
+    }
+    int x1[10] = {0};
+    int* temp = new int[10];
+    x1[10] = 12;//内存读写越界的可定位
+    *(temp+10) = 11;
+    delete[] temp;
+}
+// valgrind --tool=memcheck --leak-check=full --track-origins=yes ./test_valgrind
+/*使用这个命令，可以用valgrind定位许多问题
+1 使用未初始化的内存
+2 动态内存管理错误，诸如malloc/free；new/delete的不匹配。申请和释放的不匹配。释放后再使用！
+*/
+```
+==总之在程序崩溃的时候，如果只用gdb进行调试，很可能会跑偏方向；但是这时可以使用AddressScanitizer/valgrind查看程序问题，多种方式确定问题，快速找到问题的发生的地点！==
+### 如何避免内存泄漏
+使用智能指针：尽量使用智能指针。
+异常安全：在c++中，确保异常处理过程中释放已分配的内存！使用try_catch.RAII技术也可以。资源管理和对象生命周期绑定。
+## c/c++野指针和空悬指针
+野指针：未初始化的指针。
+空悬指针：指向的那片内存删除，回收；但指针指向地址没变。
+如何避免？
+==指针初始化/指针回收后，指向nullptr/使用指针前，判断是否为nullptr。==
+### delete nullptr发生什么
+在C++标准里是否安全？是安全的，无任何效果！
+==delete指针后，是否建议置为nullptr？总体建议，避免被删除后，再使用指针，可能掩盖后面的再一个delete 该指针的错误；但是是安全的==
+## 常见的C/C++内存错误
+```c++
+//间接引用坏指针
+int val;
+scanf("%d", &val)//正确
+scanf("%d", val)//错误
+//对于上面的情况，把val的值传入作为地址；好则程序crash；坏则某个合法读写地址被覆盖！
+
+//读未初始化内存
+/* Return y = Ax */
+int *matvec(int **A, int *x, int n)
+{
+    int i, j;
+    
+    int *y = (int *)Malloc(n * sizeof(int));//对未初始化堆内存，不能假定初始值是0。只有bss段的内存的变量值会被自动初始化为0.
+    //可以使用calloc在分配内存时初始化值为0. 如int* arr = (int*)calloc(n, sizeof(int));
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n; j++)
+            y[i] += A[i][j] * x[j];
+    return y;
+}
+
+//栈缓冲区溢出；程序的栈缓冲有限，gets不管缓冲区大小，直接全复制可能会溢出，所以一般使用fgets限制输入串大小来避免。
+void bufoverflow()
+{
+    char buf[64];
+    gets(buf); /* Here is the stack buffer overflow bug */
+    return;
+}
+
+//误解指针运算
+int *search(int *p, int val)
+{
+    while (*p && *p != val)
+        p += sizeof(int); /* Should be p++ 这里到指针指向的下一个元素，直接执行p++*/
+    return p;
+}
+
+//引用不存在的变量
+int *stackref ()
+{
+    int val;
+
+    return &val;//再退出这个函数后，val这个变量就已经不存在了。尽管返回了一个地址给外面的指针。但这时指针指向地址的值已无意义，甚至可能修改下一个函数对应地址的值！危险！
+}
+
+//内存溢出，没释放堆内存
+void leak(int n)
+{
+    int *x = (int *)Malloc(n * sizeof(int));
+    return;  /* x is garbage at this point */
+}
+```
+## nullptr 和NULL的区别
+NULL定义是一个0，而nullptr为真正的指针类型！
+在函数重载中：
+```c++
+#include <iostream>
+
+void foo(int x) {
+    std::cout << "foo() called with an int: " << x << std::endl;
+}
+
+void foo(char* x) {
+    std::cout << "foo() called with a char*: " << x << std::endl;
+}
+
+int main() {
+    // foo(NULL); // 编译错误：因为 NULL 会被解析为整数 0，导致二义性
+    foo(nullptr); // 无歧义：调用 void foo(char* x)
+}
+```
+在函数模板中：
+```c++
+#include <iostream>
+#include <type_traits>
+
+template <typename T>
+void bar(T x) {
+    if (std::is_same<T, std::nullptr_t>::value) {
+        std::cout << "bar() called with nullptr" << std::endl;
+    } else {
+        std::cout << "bar() called with a non-nullptr value" << std::endl;
+    }
+}
+
+int main() {
+    bar(NULL); // 输出：bar() called with a non-nullptr value，因为 NULL 被解析为整数 0；非指针类型，解析整数
+    bar(nullptr); // 输出：bar() called with nullptr;指针类型
+}
+```
+## C++类型萃取
+### 什么是type_traits
+C++中，类型萃取（type_traits）是一种编译时技术.用在泛型编程和在编译时做出决策。
+常见的使用例子：
+std::is_integral<T>：判断类型 T 是否为整数类型。
+std::is_floating_point<T>：判断类型 T 是否为浮点数类型。
+std::is_pointer<T>：判断类型 T 是否为指针类型。
+std::is_reference<T>：判断类型 T 是否为引用类型。
+std::is_const<T>：判断类型 T 是否为 const 类型。
+std::is_same<T, U>：判断类型 T 和 U 是否相同。
+实现原理差不多，下面是std::is_integral<T>的简单实现
+```c++
+#include <type_traits>
+
+template <typename T>
+struct is_integral_helper : std::false_type {};//类模板默认继承自flase_type
+
+template <>
+struct is_integral_helper<bool> : std::true_type {};
+
+template <>
+struct is_integral_helper<char> : std::true_type {};
+
+template <>
+struct is_integral_helper<short> : std::true_type {};
+
+template <>
+struct is_integral_helper<unsigned short> : std::true_type {};
+
+template <>
+struct is_integral_helper<int> : std::true_type {};
+
+//..... 依次类推各种整形都定义一个特化版本
+
+template <typename T>
+struct is_integral : is_integral_helper<typename std::remove_cv<T>::type> {};
+//核心思想就是为所有的整形提供一个特殊版本，其它非整形的就只能匹配到默认的版本，也就是 false_type
+typename std::remove_cv<T>::type移除const和volatile限定符。
+```
+### 萃取的使用
+```c++
+//假设我们有一个模板函数 print()，用于打印容器中的元素。我们希望这个函数对于有 const_iterator 类型的容器使用 const_iterator，而对于没有 const_iterator 的容器使用普通的 iterator
+#include <iostream>
+#include <vector>
+#include <type_traits>
+
+template <typename T>
+struct has_const_iterator {
+private:
+    typedef char yes[1];
+    typedef char no[2];
+
+    template <typename C>
+    static yes& test(typename C::const_iterator*);
+    template <typename C>
+    static no& test(...);
+public:
+    static const bool value = sizeof(test<T>(nullptr)) == sizeof(yes);
+};
+
+template <typename Container>
+typename std::enable_if<has_const_iterator<Container>::value>::type
+print(const Container& c) {
+    typename Container::const_iterator it;
+    std::cout << "Using const_iterator." << std::endl;
+    for (it = c.begin(); it != c.end(); ++it) {
+        std::cout << *it << " ";
+    }
+    std::cout << std::endl;
+}
+
+template <typename Container>
+typename std::enable_if<!has_const_iterator<Container>::value>::type
+print(const Container& c) {
+    typename Container::iterator it;
+    std::cout << "Using iterator." << std::endl;
+    for (it = c.begin(); it != c.end(); ++it) {
+        std::cout << *it << " ";
+    }
+    std::cout << std::endl;
+}
+
+int main() {
+    std::vector<int> v = {1, 2, 3, 4, 5};
+    print(v);
+}
+//总之就是类型萃取在泛型模板编程中用的比较多！
+```

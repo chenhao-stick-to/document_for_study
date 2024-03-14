@@ -17,7 +17,7 @@
  */
 class Solution {
 public:
-    ListNode* removeElements(ListNode* head, int val) {//创建头节点，一视同仁。
+    ListNode* removeElements(ListNode* head, int val) {//创建头节点，一视同仁。注意释放头节点，一视同仁！
         ListNode* dummy = new ListNode(0); 
         dummy->next = head;
         ListNode* current = dummy; 

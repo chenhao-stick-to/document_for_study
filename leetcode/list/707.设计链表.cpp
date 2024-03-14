@@ -99,7 +99,7 @@ public:
         while(current != nullptr) {
             if(index == current->index){
                 if(current->next == nullptr){//只有一个元素
-                    current->prev->next = nullptr;//注意边界条件,一定要考虑指针的有效性。
+                    current->prev->next = nullptr;//注意边界条件,一定要考虑指针的有效性。删除指针时，一定要把所有链接该指针的都置为nullptr
                     delete current;
                     break;
                 } else {
