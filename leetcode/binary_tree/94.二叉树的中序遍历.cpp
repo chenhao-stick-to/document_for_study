@@ -65,12 +65,12 @@ public:
     //     while (!stack_tree.empty() || curr) {
     //         if (curr) {
     //             stack_tree.push(curr);
-    //             curr = curr->left;
+    //             curr = curr->left;//处理左
     //         } else {
     //             curr = stack_tree.top();
-    //             result.push_back(curr->val);
+    //             result.push_back(curr->val);//处理当前的节点
     //             stack_tree.pop();
-    //             curr = curr->right;
+    //             curr = curr->right;//加入右节点！
     //         }
             
     //     }

@@ -7,7 +7,7 @@
 // @lc code=start
 class Solution {
 public:
-    vector <int> exists;//考虑不用递归，使用循环，以及使用unorder_set；而不是数组。
+    vector <int> exists;//TODO 考虑不用递归，!使用循环，以及使用unorder_set；而不是数组。
     bool isHappy(int n) {
         int temp = n;
         vector <int> bits; 

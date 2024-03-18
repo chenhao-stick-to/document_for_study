@@ -7,7 +7,7 @@
 // @lc code=start
 class Solution {
 public:
-    bool isAnagram(string s, string t) {
+    bool isAnagram(string s, string t) {//使用数组进行映射！，s则对应元素++；t则对应元素--。
         std::map<char,int> maps;//unicode可采用宽字符和字符串
         std::map<char,int> mapt;//注意map是key有序，可顺序比较。
         for (int i = 0; i < s.size(); i++) {

@@ -5,7 +5,7 @@
  */
 
 // @lc code=start
-class Solution {
+class Solution {//使用
 public:
     vector<int> intersection(vector<int>& nums1, vector<int>& nums2) {
         vector<bool> hash_vector(1001,false);

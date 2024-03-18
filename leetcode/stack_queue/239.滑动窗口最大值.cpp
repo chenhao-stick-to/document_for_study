@@ -7,7 +7,7 @@
 // @lc code=start
 class Solution {
 public:
-    vector<int> maxSlidingWindow(vector<int>& nums, int k) {
+    vector<int> maxSlidingWindow(vector<int>& nums, int k) {//单调队列的实现！。双优先队列实现也可！
         vector <int> result;
         // if (k > nums.size()) {
         //     return result;
@@ -40,7 +40,7 @@ public:
         //     heap.pop_back(); // 移除最后一个元素
         // }
 
-        //优先队列实现，单。
+        //优先队列实现，单。 
         // int max;
         // priority_queue <int> heap;
         // for (int i  = 0; i <= nums.size()-k; i++) {

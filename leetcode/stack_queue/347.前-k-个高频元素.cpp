@@ -6,10 +6,10 @@
 
 // @lc code=start
 class Solution {//考虑时间复杂度需要小于nlogn，进行<次数，数>的次数排序不可行。/堆的实现。
-public:
+public://!注意小顶堆的实现
     struct Compare {
     bool operator()(const std::pair<int, int>& a, const std::pair<int, int>& b) const {
-        return a.first> b.first;//小顶堆
+        return a.first > b.first;//小顶堆
     }
     };
     vector<int> topKFrequent(vector<int>& nums, int k) {

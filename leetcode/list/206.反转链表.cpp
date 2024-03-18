@@ -28,7 +28,7 @@ public:
     //     }
     //     return prev;
 
-    // }
+    // } 
     ListNode* reverseList(ListNode* head) {//双指针法，正向递归和反向递归；正向递归和双指针类似，这里写一个反向递归
         if(head == nullptr) return nullptr;
         if(head->next == nullptr) return head;

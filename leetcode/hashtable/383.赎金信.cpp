@@ -7,11 +7,11 @@
 // @lc code=start
 class Solution {
 public:
-    bool canConstruct(string ransomNote, string magazine) {
+    bool canConstruct(string ransomNote, string magazine) {//TODO 一般对字母的哈希，可使用数组，因为只有26个很有限！
         unordered_map <int,int> hash_ran;
         unordered_map <int,int> hash_mag;
         for (int i = 0; i < ransomNote.size(); i++) {
-            if(hash_ran.find(ransomNote[i]) != hash_ran.end()) {
+            if (hash_ran.find(ransomNote[i]) != hash_ran.end()) {
                 hash_ran[ransomNote[i]]++;
             } else {
                 hash_ran.insert(std::make_pair(ransomNote[i],1));

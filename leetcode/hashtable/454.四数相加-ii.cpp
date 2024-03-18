@@ -8,7 +8,7 @@
 class Solution {
 public:
     int fourSumCount(vector<int>& nums1, vector<int>& nums2, vector<int>& nums3, vector<int>& nums4) {
-            std::unordered_map <int,int> hash1_2;
+            std::unordered_map <int,int> hash1_2;//TODO 使用unorder,查找效果为O(1)；所以正常来说。第二个map没必要创建，直接两次循环，查找map记录即可！
             std::unordered_map <int,int> hash3_4;
             for (int i = 0; i < nums1.size(); i++) {
                 for (int j = 0; j < nums2.size(); j++) {

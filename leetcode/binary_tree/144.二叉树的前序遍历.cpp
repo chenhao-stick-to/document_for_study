@@ -52,7 +52,7 @@ public:
     // }
 
     //统一迭代法，
-    vector<int> preorderTraversal(TreeNode* root) {
+    vector<int> preorderTraversal(TreeNode* root) {//注意对首先处理的元素加入nullptr的标志！
         vector <int> result;
         stack <TreeNode*> stack_tree;
         if (root != nullptr) stack_tree.push(root);
