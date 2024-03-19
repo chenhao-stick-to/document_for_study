@@ -70,7 +70,7 @@ public:
     //             curr = stack_tree.top();
     //             result.push_back(curr->val);//处理当前的节点
     //             stack_tree.pop();
-    //             curr = curr->right;//加入右节点！
+    //             curr = curr->right;//加入右节点
     //         }
             
     //     }
