@@ -10,10 +10,14 @@ public:
     vector <string> path;
     vector <vector<string>> result;
     string s_;
-    bool judge_true(string& s) {
+    bool judge_huiwen(string& s) {
         if (s.size() == 1) return true;
-        if (s.size() > 1 && s[0] == "0") return false;
-        if ()
+        int i = 0;
+        int j = s.size()-1;
+        for(;i < j; i++,j--) {
+            if (s[i] != s[j]) return false;
+        }
+        return true;
     }
     void backtracking(int index) {
         if (index == s_.size() ) {
