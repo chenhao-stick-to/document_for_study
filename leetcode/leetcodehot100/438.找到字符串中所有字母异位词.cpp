@@ -20,19 +20,20 @@ public:
         multiset <char> temp1 = set_p;
         while(i < s.size()-slid_size+1) {
             string temp = s.substr(i,slid_size);
-            for (int j = 0; j < slid_size; j++) {
+            int j = 0;
+            for (; j < slid_size; j++) {
                 if (temp1.count(temp[j]) == 0) {
-                    break;
+                    break;             
                 } else {
                     auto iter = temp1.find(temp[j]);
                     temp1.erase(iter);
                 }
             }
             if (temp1.size() == 0) {
-                result.push_back(i);
+                result. (i);
             }
             temp1 = set_p;
-            i++;
+            i += 1;
         }
         return result;
     }
